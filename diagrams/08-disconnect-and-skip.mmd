@@ -1,0 +1,79 @@
+%% Диаграмма последовательности: отключение игрока и пропуск хода.
+%% Таймеров хода нет. Столкновений нет. Grace-окно и реконнект.
+%% Важно: в init.sql нет ни players.last_seen, ни games.last_seen,
+%% и нет moves.closed_at. Поэтому присутствие живёт в эфемерном
+%% хранилище сервера, а в БД перепроверяется только владелец хода.
+sequenceDiagram
+    autonumber
+    actor P as Отключившийся игрок
+    participant SPA as Клиент игрока
+    participant BE as Веб-сервер<br/>presence
+    participant MEM as Хранилище присутствия<br/>in-memory или Redis
+    participant W as Фоновый воркер
+    participant DB as PostgreSQL
+    participant SSE as SSE-хаб
+
+    Note over P,SPA: Нормальная игра. Соединение SSE живо
+
+    P->>SPA: Играет
+    SPA->>BE: GET /api/games/42/events
+    BE->>MEM: presence.connect(42, sub, sid_conn)
+    Note over BE,MEM: Сервер шлёт heartbeat каждые 15 секунд.<br/>Если за 30 секунд heartbeat не ушёл,<br/>соединение считается мёртвым
+    BE-->>SPA: поток открыт
+
+    Note over P,SPA: Событие 1. Сеть пропала
+
+    SPA--xBE: TCP-обрыв, поток SSE разорван
+    Note over SPA: EventSource сам переподключается<br/>с тем же Last-Event-ID
+
+    Note over BE,MEM: Событие 2. Сервер замечает разрыв
+    BE->>MEM: presence.mark_suspect(42, sub)
+    Note over MEM: Не удаляем сразу. Даём grace-окно,<br/>потому что игрок может вернуться через паузу
+    Note over MEM: presence.set_grace(42, sub, <br/>RECONNECT_GRACE = 120 секунд)
+
+    Note over SPA: Клиент шлёт переподключения<br/>каждые 5 секунд
+
+    alt Игрок вернулся в пределах grace-окна
+        SPA->>BE: GET /api/games/42/events<br/>Last-Event-ID: 14
+        BE->>MEM: presence.restore(42, sub)
+        Note over BE,MEM: Таймер пропуска снят. Ничего не произошло
+        BE->>DB: SELECT fn_poll_changes(42, 14)
+        DB-->>BE: events в порядке id_move
+        BE-->>SPA: event: turn_started<br/>id: 21
+        Note over SPA: Ход не пропущен, догон изменений<br/>через курсор по moves
+    else Игрок не вернулся в течение 120 секунд
+        SPA--xBE: переподключения не восстанавливаются
+        W->>MEM: presence.take_expired()
+        W->>W: Условие пропуска.<br/>Вне транзакции берём кандидатов из реестра присутствия,<br/>а внутри базы обязаны перепроверить владельца хода.<br/>Иначе переподключившийся в последний момент игрок<br/>потеряет свой ход
+        Note over W: 1. Владелец открытого хода - действительно он
+        W->>DB: SELECT move_status FROM games WHERE id_game = 42
+        DB-->>W: move_status = true
+        W->>DB: SELECT id_player FROM players p LEFT JOIN moves m<br/>ON m.id_player = p.id_player<br/>WHERE p.id_game = 42 GROUP BY p.id_player<br/>HAVING count(m.id_move) = (<br/>SELECT max(cnt) FROM (SELECT count(*) AS cnt FROM moves GROUP BY id_player) t)
+        DB-->>W: id_player = 12
+        Note over W: 2. В колоде и в руке этого игрока<br/>есть карты, которые он обязан отыграть.<br/>Иначе он не может завершить ход, и пропуск<br/>сдвинет игру несправедливо
+        W->>DB: SELECT count(*) FROM cards c<br/>WHERE c.id_game = 42<br/>AND c.id_card NOT IN (SELECT id_card FROM player_cards)<br/>AND c.id_card NOT IN (SELECT id_card FROM discard)
+        DB-->>W: deck_size = 18
+        W->>DB: SELECT count(*) FROM player_cards<br/>WHERE id_player = 12 AND is_public = false
+        DB-->>W: hand_size = 4
+
+        Note over W: Условия выполнены, пропуск разрешён
+
+        W->>DB: BEGIN
+        W->>DB: CALL sp_skip_disconnected_turn(42, sub)
+        Note over DB: Под блокировкой games FOR UPDATE повторно<br/>сверяется владелец открытого хода. Процедура идемпотентна:<br/>если игрок успел вернуться и сыграть, вернётся<br/>skipped = false и ничего не изменится.<br/>Тот же приём у всех sp_ - защита от гонки
+        DB-->>W: { skipped: true, next_player_id: 87 }
+        W->>DB: COMMIT
+        W->>MEM: presence.remove(42, sub)
+
+        W->>DB: SELECT fn_notify_state_changed(42, 'turn_skipped',<br/>{ player_id: 12, reason: 'disconnect_timeout' })
+        DB->>SSE: pg_notify
+        SSE-->>P: нет соединения у этого игрока
+
+        Note over P,SSE: Игрок вернулся через 10 минут
+        SPA->>BE: GET /api/games/42/events
+        BE->>DB: SELECT fn_poll_changes(42, 14)
+        Note over DB: Курсор 14 отстал. Вернулись все события<br/>пропущенных ходов, клиент их доиграет
+        DB-->>BE: events с id_move 21, 35, 49
+        BE-->>SPA: event: turn_skipped<br/>id: 21
+        Note over SPA: Клиент показывает пропуск хода.<br/>Ход в лобби остаётся, место не освобождается.<br/>Игрок может вернуться и ждать следующего хода
+    end

@@ -1,0 +1,65 @@
+%% Диаграмма последовательности: сыгр карты с руки. Ядро игрового цикла.
+%% Показывает блокировку строки партии, универсальную sp_move_card
+%% и обязательное срабатывание pg_notify.
+sequenceDiagram
+    autonumber
+    actor P1 as Игрок 1
+    actor P2 as Игрок 2
+    participant SPA1 as Клиент игрока 1
+    participant BE as Веб-сервер
+    participant DB as PostgreSQL
+    participant SSE as SSE-хаб
+
+    Note over P1,SPA: Ручка игрока скрыта от всех. Сервер отдаёт её<br/>только по fn_get_seat, чужая рука в выборку не попадает
+
+    P1->>SPA1: POST /api/games/42/turn/play { card_id: 5001, target_player_id: null }
+    SPA1->>BE: POST /api/games/42/turn/play
+    BE->>BE: fn_get_seat(42, user_id) -> id_player = 12
+
+    BE->>DB: BEGIN
+    BE->>DB: SELECT move_status FROM games WHERE id_game = 42 FOR UPDATE
+    Note over DB: Блокировка строки партии.<br/>Все действия всех игроков выстраиваются<br/>в очередь, гонки невозможны
+    DB-->>BE: move_status = true
+
+    BE->>DB: SELECT id_player FROM players WHERE id_game = 42 AND move_order = 1
+    DB-->>BE: id_player = 12
+    Note over BE: Сверено: это ход именно игрока 12
+
+    BE->>DB: CALL sp_play_card(42, 12, 5001, NULL, NULL, '{}')
+
+    Note over DB: Определяем механику карты
+    DB->>DB: SELECT m.mechanic_name<br/>FROM cards c<br/>JOIN template_mechanics tm ON tm.id_card_template = c.id_card_template<br/>JOIN mechanics m ON m.id_mechanic = tm.id_mechanic<br/>WHERE c.id_card = 5001
+    DB-->>DB: { MOVE_TO_STABLE }
+
+    Note over DB: Проверки перед перемещением
+    Note over DB: - карта лежит в player_cards с is_public = false
+    Note over DB: - ход открыт и принадлежит игроку
+    Note over DB: - размер руки не больше HAND_LIMIT
+
+    BE->>DB: CALL sp_move_card(42, 5001,<br/>'hand', 'stable', 12, 1, NULL)
+
+    Note over DB: Смена зоны - это переписывание двух таблиц:<br/>1. player_cards: is_public с false на true.<br/>Строка не удаляется и не вставляется заново,<br/>поэтому порядок в стойле теряется без последствий
+    Note over DB: 2. В стойле нет позиции, в схеме её нет.<br/>Порядок стойла правилами не важен
+
+    DB-->>BE: зона обновлена
+
+    BE->>DB: INSERT INTO cards_in_moves (1, 5001) ON CONFLICT DO NOTHING
+    Note over DB: Журнал хода. PRIMARY KEY (id_move, id_card)<br/>защищает от повторной записи при ретрае
+
+    Note over DB: TRIGGER_ON_ENTER_STABLE.<br/>Если шаблон карты имеет эту механику,<br/>сервер выполняет её эффект в этой же транзакции
+
+    Note over DB: Обновление счетчиков и проверка победы
+    BE->>DB: SELECT fn_check_victory(42)
+    Note over DB: Порог единорогов: 7 при 2-5 игроках,<br/>6 при 6 игроках. Пока не достигнут - status = playing
+    DB-->>BE: { status: playing, winner_player_id: null }
+
+    BE->>DB: COMMIT
+
+    BE->>DB: SELECT fn_notify_state_changed(42, 'cards_played',<br/>{ player_id: 12, card_id: 5001, to: 'stable', id_move: 1 })
+    DB->>SSE: pg_notify 'game_events'
+    SSE-->>P1: event: cards_played<br/>id: 1
+    SSE-->>P2: event: cards_played<br/>id: 1
+
+    Note over P1,SSE: Публичная информация уходит всем игрокам сразу.<br/>SSE-хаб рассылает из одного вызова pg_notify,<br/>клиенты не делают запросов состояния
+
+    Note over P2,SSE: У соперников обновляется стойло игрока 1.<br/>Карты на руке игрока 1 в их дельте нет,<br/>fn_get_game_state её туда не включает

@@ -1,0 +1,83 @@
+%% Конечный автомат состояний партии и хода.
+%% В init.sql нет ни games.status, ни games.current_player_id,
+%% ни games.turn_phase. Поэтому состояние выводится, а не хранится.
+%% В диаграмме для каждого состояния указано, чем оно определяется.
+stateDiagram-v2
+    direction TB
+
+    state "Лобби" as Lobby {
+        [*] --> Collecting
+        Collecting: Сбор игроков
+        Collecting: number_of_players растёт при sp_join_game
+        Collecting --> Starting: sp_start_game, только is_admin
+        Starting: Раздача
+        Starting: move_status = false
+        Starting --> [*]: sp_create_cards плюс sp_deal_cards
+    }
+
+    state "Игра" as Playing {
+        direction TB
+
+        state "Ход игрока N" as Turn {
+            direction TB
+            [*] --> DrawStart
+            DrawStart: Начало хода
+            DrawStart: move_status = true, в moves появилась строка игрока
+            DrawStart --> DrawPhase: спутанные подтверждения
+
+            DrawPhase: Фаза добора
+            DrawPhase: p_parameters сервера, держится в памяти
+            DrawPhase --> ActionPhase: подтверждение
+
+            ActionPhase: Фаза действия
+            ActionPhase: sp_play_card, sp_discard_from_hand, sp_draw_cards
+            ActionPhase --> ActionPhase: сыграна карта
+            ActionPhase --> Skipped: сработал TRIGGER_ON_LEAVE_STABLE
+
+            Skipped: Ход пропущен
+            Skipped: та же транзакция, что и обычное действие
+            Skipped --> EndPhase
+
+            EndPhase: Завершение хода
+            EndPhase: sp_end_turn, рука не больше HAND_LIMIT
+            EndPhase --> CheckVictory
+
+            CheckVictory: Проверка победы
+            CheckVictory --> [*]
+        }
+
+        Turn --> Turn: move_order следующего игрока
+    }
+
+    state "Завершена" as Finished {
+        [*]
+    }
+
+    [*] --> Lobby
+    Playing --> Finished: fn_check_victory вернула winner
+    Playing --> Finished: fn_check_victory вернула winner null, ничья
+    Finished --> [*]
+
+    note right of Lobby
+        Хранится в БД:
+        games.move_status = false,
+        games.number_of_players,
+        players.is_admin
+    end note
+
+    note right of Playing
+        Хранится в БД:
+        games.move_status = true,
+        наличие открытой строки в moves,
+        move_order в players
+        Не хранится:
+        фаза хода, только в p_parameters сервера
+    end note
+
+    note right of Finished
+        Отдельного признака нет.
+        Состояние выводится повторным
+        вызовом fn_check_victory.
+        Переживает перезапуск сервера
+        без потери данных
+    end note

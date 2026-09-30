@@ -1,0 +1,72 @@
+%% Компонентная диаграмма выбранной архитектуры.
+%% Сервер-авторитетный turn-based сервер + stateless-фронтенд + push через SSE.
+%% Единственный источник истины - PostgreSQL. Клиент никогда не обращается к БД.
+flowchart LR
+
+    subgraph CLIENT["Клиентский слой — stateless, без игровой логики"]
+        SPA["SPA / Web-клиент<br/>React-подобный UI<br/>только отображение состояния"]
+        MOB["Мобильный клиент<br/>тот же контракт"]
+    end
+
+    subgraph EDGE["Периметр"]
+        PROXY["HTTPS-терминация<br/>TLS, лимит тела запроса"]
+    end
+
+    subgraph APP["Прикладной слой — веб-сервер"]
+        AUTH["OIDC-адаптер<br/>обмен code+PKCE, проверка JWT<br/>по кэшу JWKS, свой sid в cookie"]
+        ROUTER["REST-роутер<br/>маршрутизация и валидация тела"]
+        RULE["Диспетчер эффектов<br/>switch по card_templates.card_name<br/>чистая логика правил"]
+        SSE["SSE-хаб<br/>одно соединение = один игрок<br/>fan-out, heartbeat, Last-Event-ID"]
+        PRES["Реестр присутствия<br/>в памяти, НЕ в БД<br/>grace-окно переподключения"]
+        WORKER["Воркер устойчивости<br/>периодический опрос,<br/>не таймер хода"]
+    end
+
+    subgraph DBL["PostgreSQL — источник истины"]
+        PROC["Все SQL-процедуры<br/>sp_* изменяют, fn_* читают<br/>одна транзакция = одно действие"]
+        TBL[("Таблицы init.sql<br/>без изменений")]
+        NOTIFY["Канал pg_notify<br/>game_events — шина событий"]
+        LOCK["Блокировки строки партии<br/>SELECT FOR UPDATE<br/>сериализация гонок"]
+    end
+
+    subgraph IDP["OIDC-провайдер (внешний, не наша зона)"]
+        AUTHZ["Authorization Endpoint"]
+        TOKEN["Token Endpoint"]
+        JWKS["JWKS Endpoint"]
+    end
+
+    SPA -->|HTTPS REST/JSON| PROXY
+    MOB -->|HTTPS REST/JSON| PROXY
+    PROXY --> ROUTER
+    PROXY --> SSE
+
+    SPA -->|EventSource: cookies, Last-Event-ID| SSE
+    MOB -->|EventSource: cookies, Last-Event-ID| SSE
+
+    ROUTER --> AUTH
+    AUTH <-->|code, verifier| TOKEN
+    AUTH <-->|ключи подписи| JWKS
+    SPA -.->|редирект на авторизацию| AUTHZ
+    MOB -.->|редирект на авторизацию| AUTHZ
+
+    ROUTER --> RULE
+    RULE -->|вызов sp_* в транзакции| PROC
+    ROUTER -->|вызов fn_* на чтение| PROC
+    PROC --> TBL
+    PROC -->|FOR UPDATE| LOCK
+    PROC -->|pg_notify| NOTIFY
+
+    NOTIFY -->|LISTEN| SSE
+    SSE -->|text/event-stream| SPA
+    SSE -->|text/event-stream| MOB
+
+    SSE -.->|обновление присутствия| PRES
+    ROUTER -.->|обновление присутствия| PRES
+    WORKER -->|опрос grace-окна| PRES
+    WORKER -->|sp_skip_disconnected_turn<br/>с перепроверкой в БД| PROC
+
+    SSE -.->|чтение снапшота<br/>и дневника ходов| PROC
+
+    classDef db fill:#e8f0fe,stroke:#3367d6,color:#111
+    classDef ext fill:#fef7e0,stroke:#f9ab00,color:#111
+    class PROC,TBL,NOTIFY,LOCK db
+    class AUTHZ,TOKEN,JWKS ext
