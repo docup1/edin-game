@@ -4,15 +4,13 @@
 %% Диаграмма делится по смыслу, а не по наличию {game_id}: пароль ставит
 %% админ, но до игры, поэтому разбирается здесь.
 sequenceDiagram
-    autonumber
     actor U as Пользователь
-    actor H as Хост<br/>(организатор игры)
     participant C as Клиент
     participant S as Сервер
     participant K as Кэш
     participant D as БД
+    actor H as Хост<br/>(организатор игры)
 
-    U->>C: Смотрит список открытых партий
     C->>S: GET /api/games?has_slot=1&mine=0&limit=50&offset=0
     S->>D: Вызвать fn_list_open_games
     D-->>S: Страница списка и total

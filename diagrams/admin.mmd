@@ -2,7 +2,6 @@
 %% Роль admin приходит из токена провайдера при входе и лежит в сессии.
 %% Общий ответ для всех эндпоинтов админки: 401 без сессии, 403 если роль не admin.
 sequenceDiagram
-    autonumber
     actor A as Администратор
     participant C as Клиент
     participant S as Сервер
