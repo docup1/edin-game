@@ -20,7 +20,7 @@ sequenceDiagram
     P-->>U: 302 Location на адрес колбэка с кодом и state
     U->>C: Браузер вернулся на наш адрес
 
-    C->>S: GET /api/auth/callback с кодом и state
+    C->>S: GET /api/auth/callback<br/>код<br/>state
     S->>K: Сверить state и nonce с сохранёнными
     K-->>S: Совпало
     S->>P: Обмен кода на токены

@@ -15,7 +15,7 @@ sequenceDiagram
     C->>S: Общий поток уже открыт, состояние пришло
 
     U->>C: Нажал «сыграть» на карте
-    C->>S: POST /api/games/{game_id}/event<br/>action=play, card_id, при необходимости target_id
+    C->>S: POST /api/games/{game_id}/event<br/>ход<br/>id запроса<br/>действие<br/>id карты<br/>id цели?
     S->>K: Проверить номер хода и что request_id не повтор
     S->>D: Вызвать sp_apply_event
     D-->>S: Новое состояние

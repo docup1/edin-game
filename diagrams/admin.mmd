@@ -18,7 +18,7 @@ sequenceDiagram
     S-->>C: 200 { items }
 
     A->>C: Заводит новую карту
-    C->>S: POST /api/admin/cards<br/>название, описание, ссылка на картинку
+    C->>S: POST /api/admin/cards<br/>название<br/>описание<br/>ссылка на картинку
     S->>D: Вызвать sp_create_card_template
     D-->>S: id шаблона
     S-->>C: 201 { template_id }, при ошибке 409 / 422
@@ -28,13 +28,13 @@ sequenceDiagram
     S->>D: Вызвать fn_list_mechanics
     D-->>S: Список механик
     S-->>C: 200 { id, name, type }
-    C->>S: PUT /api/admin/cards/{template_id}/mechanics
+    C->>S: PUT /api/admin/cards/{template_id}/mechanics<br/>список id механик
     S->>D: Вызвать sp_set_card_mechanics со списком id
     D-->>S: Итоговый набор
     S-->>C: 200 { mechanics }, при ошибке 404 / 422
 
     A->>C: Правит описание
-    C->>S: PATCH /api/admin/cards/{template_id}
+    C->>S: PATCH /api/admin/cards/{template_id}<br/>любые из:<br/>название<br/>описание<br/>ссылка на картинку
     S->>D: Вызвать sp_update_card_template
     D-->>S: Обновлено
     S->>D: Вызвать fn_get_card_template
@@ -42,7 +42,7 @@ sequenceDiagram
     S-->>C: 200 { template }, при ошибке 404 / 409
 
     A->>C: Выбирает партию и жмёт «добавить карт»
-    C->>S: POST /api/admin/games/{game_id}/cards<br/>id шаблона и количество
+    C->>S: POST /api/admin/games/{game_id}/cards<br/>id шаблона<br/>сколько добавить
     S->>D: Вызвать sp_add_cards_to_game
     D-->>S: Сколько добавили
     S->>C: Уведомить игроков партии, колода изменилась

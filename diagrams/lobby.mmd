@@ -20,7 +20,7 @@ sequenceDiagram
     S->>C: Обновлённый список уходит в общий поток
 
     U->>C: Создать партию, он становится хостом
-    C->>S: POST /api/games<br/>name, max_players, password?
+    C->>S: POST /api/games<br/>имя<br/>сколько игроков<br/>пароль?
     S->>D: Вызвать sp_create_game
     D-->>S: id партии
     S->>K: Запомнить состав лобби
@@ -28,12 +28,12 @@ sequenceDiagram
     S->>C: Обновлённый состав лобби уходит в поток
 
     H->>C: Поменять настройки
-    C->>S: PATCH /api/games/{game_id}<br/>Любые из name, max_players, password
+    C->>S: PATCH /api/games/{game_id}<br/>любые из:<br/>имя<br/>сколько игроков<br/>пароль
     S->>D: Вызвать sp_update_game
     D-->>S: Обновлено
     S-->>C: 200 { game }, при ошибке 401 / 403 / 404 / 409
 
-    C->>S: POST /api/games/{game_id}/password
+    C->>S: POST /api/games/{game_id}/password<br/>пароль
     S->>D: Вызвать sp_set_game_password
     D-->>S: Принято
     S-->>C: 204, при ошибке 401 / 403 / 404 / 409
@@ -46,7 +46,7 @@ sequenceDiagram
     S-->>C: 204, при ошибке 401 / 403 / 404 / 409
 
     U->>C: Войти в партию
-    C->>S: POST /api/games/{game_id}/join<br/>password?
+    C->>S: POST /api/games/{game_id}/join<br/>пароль?
     S->>D: Вызвать sp_join_game
     D-->>S: Слот игрока и его стартовые карты
     S->>K: Отметить игрока как подключённого
