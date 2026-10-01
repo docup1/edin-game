@@ -5,11 +5,11 @@
 %% админ, но до игры, поэтому разбирается здесь.
 sequenceDiagram
     actor U as Пользователь
+    actor H as Хост<br/>(организатор игры)
     participant C as Клиент
     participant S as Сервер
     participant K as Кэш
     participant D as БД
-    actor H as Хост<br/>(организатор игры)
 
     %% Фильтры has_slot и mine живут в колонке Query таблицы в API.md,
     %% на стрелке их нет: список и так уходит в поток целиком.
