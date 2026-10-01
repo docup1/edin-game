@@ -46,7 +46,9 @@ sequenceDiagram
     C->>S: PATCH /api/admin/cards/{template_id}
     S->>D: Вызвать sp_update_card_template
     D-->>S: Обновлено
-    S-->>C: Сохранено
+    S->>D: Вызвать fn_get_card_template
+    D-->>S: Шаблон с механиками
+    S-->>C: Сохранено, шаблон с механиками
 
     Note over A,C: Дальше карту можно положить в колоду партии.
 
