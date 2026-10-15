@@ -11,7 +11,7 @@ sequenceDiagram
     participant K as Кэш
     participant D as БД
 
-    %% Фильтры has_slot и mine живут в колонке Query таблицы в API.md,
+    %% Фильтры has_slot, mine и search живут в колонке Query таблицы в API.md,
     %% на стрелке их нет: список и так уходит в поток целиком.
     C->>S: GET /api/games
     S->>D: Вызвать fn_list_open_games

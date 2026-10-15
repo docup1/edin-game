@@ -524,7 +524,8 @@ $$ LANGUAGE sql STABLE;
 CREATE OR REPLACE FUNCTION fn_list_open_games(
     p_has_slot boolean DEFAULT TRUE,
     p_mine     boolean DEFAULT FALSE,
-    p_id_user  uuid    DEFAULT NULL
+    p_id_user  uuid    DEFAULT NULL,
+    p_search   text    DEFAULT NULL
 ) RETURNS jsonb AS $$
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
         'id',             g.id_game,
@@ -538,7 +539,10 @@ CREATE OR REPLACE FUNCTION fn_list_open_games(
     WHERE (NOT p_has_slot
            OR (SELECT count(*) FROM players p WHERE p.id_game = g.id_game) < g.number_of_players)
       AND (NOT p_mine
-           OR EXISTS (SELECT 1 FROM players p WHERE p.id_game = g.id_game AND p.user_id = p_id_user));
+           OR EXISTS (SELECT 1 FROM players p WHERE p.id_game = g.id_game AND p.user_id = p_id_user))
+      AND (p_search IS NULL OR p_search = ''
+           OR ('Партия #' || g.id_game) ILIKE '%' || p_search || '%'
+           OR g.id_game::text ILIKE p_search || '%');
 $$ LANGUAGE sql STABLE;
 
 
