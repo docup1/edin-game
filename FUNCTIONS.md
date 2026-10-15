@@ -7,7 +7,7 @@
 | `_mechanic_description` | `p_name mechanic_name_enum` | `text` | Возвращает человекочитаемое описание механики по её enum-значению | Наполняет справочник механик (`fn_list_mechanics`) |
 | `_game_lock` | `p_id_game bigint` | `void` | Берёт строку партии под `FOR UPDATE`; если партии нет — `ED001` | Сериализует конкурентные изменения одной партии |
 | `_game_started` | `p_id_game bigint` | `boolean` | Читает `games.move_status` | Единая проверка «партия уже началась» |
-| `_zone_of` | `p_id_card bigint` | `text` | Где карта лежит сейчас: `stable`/`hand`/`discard`/`deck` | Универсальный запрос зоны карты |
+| `_lock_started` | `p_id_game bigint` | `void` | Берёт партию под `FOR UPDATE` и требует, что она началась; нет партии → `ED001`, не началась → `ED003` | Общий пролог изменяющих игру функций |
 | `_cards_in_zone` | `p_id_game bigint, p_zone text, p_id_player bigint DEFAULT NULL` | `SETOF bigint` | Универсальный список карт зоны: `hand`/`stable` (для игрока), `deck` (остаток колоды), `discard` (сброс партии) | Один примитив вместо `_hand`/`_stable`/`_deck_card_ids` |
 | `_move_card` | `p_id_player bigint, p_id_card bigint, p_zone text` | `void` | Универсальное перемещение карты в `hand`/`stable`/`deck`/`discard` без запуска leave-триггера | Один примитив вместо `_to_hand`/`_to_stable`/`_to_deck`/`_discard_card` |
 | `_card_mechanics` | `p_id_card bigint` | `SETOF mechanic_name_enum` | Возвращает механики карты через её шаблон (`template_mechanics`) | Проверка и применение эффектов карты |
@@ -15,11 +15,11 @@
 | `_player_unicorns` | `p_id_player bigint` | `int` | Считает карты в стойле с механикой `COUNT_AS_UNICORN` | Определение победителя и тай-брейк |
 | `_is_protected` | `p_id_player bigint` | `boolean` | Есть ли в стойле механика `PROTECT_STABLE` | Запрет уничтожения/жертвы стойла |
 | `_is_restricted` | `p_id_player bigint` | `boolean` | Есть ли в стойле механика `RESTRICT_CARD_PLAY` | Запрет игроку разыгрывать карты |
-| `_opponent_stable_cards` | `p_id_game bigint, p_actor bigint` | `SETOF bigint` | Возвращает карты в стойлах всех игроков партии, кроме актора | Список допустимых целей для DESTROY/STEAL |
 | `_last_mover` | `p_id_game bigint` | `bigint` | Игрок последнего завершённого хода (`moves`) | База для вычисления текущего игрока |
 | `_next_player` | `p_id_game bigint, p_id_player bigint` | `bigint` | Следующий игрок по `move_order` (циклично); при `NULL` — первый | Передача хода по кругу |
 | `_current_player` | `p_id_game bigint` | `bigint` | Текущий игрок = следующий после последнего хода | Определение, чей сейчас ход |
 | `_turn_number` | `p_id_game bigint` | `int` | Номер открытого хода = `count(moves по игре) + 1` | Проверка актуальности хода и счётчик |
+| `_record_move` | `p_id_player bigint` | `void` | Записывает завершённый ход игрока (`max(move_number)+1`) | Фиксация хода `sp_end_turn`/`sp_skip_turn` |
 | `_notify` | `p_id_game bigint, p_event text` | `void` | Шлёт `pg_notify` в канал `edin_game` с id партии и событием | Реалтайм-оповещение сервера/клиентов |
 | `_trigger_depth` | — | `int` | Возвращает текущую глубину каскада триггеров из `edin.trigger_depth` | Защита от бесконечной рекурсии триггеров |
 | `_fire_leave_stable` | `p_id_card bigint` | `void` | Запускает `TRIGGER_ON_LEAVE_STABLE` при выходе карты из стойла (лимит глубины 5) | Срабатывание «выход из стойла» (зовётся явно только на DESTROY/SACRIFICE) |
