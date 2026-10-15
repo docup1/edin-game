@@ -1,4 +1,7 @@
--- 01: лобби - создание, список, join, пароль, настройки, отмена, выход.
+-- 01: лобби - создание, список, вход/выход, места, пароль, отмена.
+-- Чёрный ящик: только публичные fn_*/sp_*. БД - тупое хранилище: бизнес-правил
+-- (свободные места, пароль, права хоста) она не проверяет - это делает сервер.
+-- Здесь проверяются данные и что читалки отдают NULL/[] вместо ошибок.
 BEGIN;
 
 DO $$
@@ -11,159 +14,109 @@ DECLARE
     v_p1    bigint;
     v_p2    bigint;
 BEGIN
-    -- создание
-    v := sp_create_game(v_host, 'Пятница', 2, NULL);
+    -- создание: синтетическое имя, создатель - хост
+    v := sp_create_game(v_host, 2);
     v_game := (v->>'game_id')::bigint;
     v_p1   := (v->>'player_id')::bigint;
     ASSERT v_game > 0, 'партия не создана';
     ASSERT (v->>'is_host')::boolean, 'создатель не хост';
 
-    -- виден в списке со свободным местом
-    PERFORM 1 FROM jsonb_array_elements(fn_list_open_games(TRUE, FALSE)) e
-      WHERE (e->>'id')::bigint = v_game;
-    ASSERT FOUND, 'партия не видна в открытых';
+    -- партии нет -> читалки отдают NULL/[]
+    ASSERT fn_get_game_state(v_game + 100000) IS NULL, 'нет партии - не NULL';
+    ASSERT fn_get_game_password(v_game + 100000) IS NULL, 'нет партии - пароль не NULL';
+    ASSERT fn_get_player(v_guest) = '[]'::jsonb, 'нет мест - не пустой массив';
 
-    -- mine=1 (только мои)
-    PERFORM 1 FROM jsonb_array_elements(fn_list_open_games(FALSE, TRUE, v_host)) e
-      WHERE (e->>'id')::bigint = v_game;
-    ASSERT FOUND, 'своя партия не видна в mine';
-    ASSERT NOT EXISTS (
-        SELECT 1 FROM jsonb_array_elements(fn_list_open_games(FALSE, TRUE, v_third)) e
-        WHERE (e->>'id')::bigint = v_game), 'чужая партия видна в mine';
-
-    -- search: по номеру партии находит, чужой номер не находит
+    -- места пользователя
     ASSERT EXISTS (
-        SELECT 1 FROM jsonb_array_elements(fn_list_open_games(TRUE, FALSE, NULL, v_game::text)) e
-        WHERE (e->>'id')::bigint = v_game), 'search не нашёл партию по номеру';
-    ASSERT NOT EXISTS (
-        SELECT 1 FROM jsonb_array_elements(fn_list_open_games(TRUE, FALSE, NULL, (v_game + 999)::text)) e
-        WHERE (e->>'id')::bigint = v_game), 'search нашёл лишнее';
+        SELECT 1 FROM jsonb_array_elements(fn_get_player(v_host)) e
+        WHERE (e->>'id_game')::bigint = v_game
+          AND (e->>'is_host')::boolean
+          AND (e->>'move_order')::int = 1), 'fn_get_player не отдал место';
+
+    -- видна в списке со свободным местом
+    ASSERT EXISTS (
+        SELECT 1 FROM jsonb_array_elements(fn_list_open_games(TRUE)) e
+        WHERE (e->>'id')::bigint = v_game
+          AND (e->>'name') = 'Партия #' || v_game
+          AND (e->>'seats')::int = 2
+          AND (e->>'occupied')::int = 1
+          AND NOT (e->>'needs_password')::boolean
+          AND NOT (e->>'started')::boolean), 'партия не видна в открытых';
+
+    -- mine=TRUE - только свои
+    ASSERT EXISTS (SELECT 1 FROM jsonb_array_elements(fn_list_open_games(FALSE, TRUE, v_host)) e
+                   WHERE (e->>'id')::bigint = v_game), 'своя партия не видна в mine';
+    ASSERT NOT EXISTS (SELECT 1 FROM jsonb_array_elements(fn_list_open_games(FALSE, TRUE, v_third)) e
+                       WHERE (e->>'id')::bigint = v_game), 'чужая партия видна в mine';
+
+    -- search: по номеру находит
+    ASSERT fn_list_open_games(FALSE, FALSE, NULL, v_game::text)
+           @> jsonb_build_array(jsonb_build_object('id', v_game)), 'search не нашёл партию';
 
     -- заходим вторым
-    v := sp_join_game(v_guest, v_game, NULL);
+    v := sp_join_game(v_guest, v_game);
     v_p2 := (v->>'player_id')::bigint;
-    ASSERT v_p2 > 0, 'гость не зашёл';
-    ASSERT NOT (v->>'is_host')::boolean, 'гость вдруг хост';
+    ASSERT v_p2 > 0 AND NOT (v->>'is_host')::boolean, 'гость не зашёл';
+    ASSERT v->'hand' = '[]'::jsonb, 'рука до старта не пуста';
 
-    -- мест больше нет -> has_slot=1 прячет
-    ASSERT NOT EXISTS (
-        SELECT 1 FROM jsonb_array_elements(fn_list_open_games(TRUE, FALSE)) e
-        WHERE (e->>'id')::bigint = v_game), 'полная партия не спрятана';
+    -- мест больше нет -> has_slot прячет
+    ASSERT NOT EXISTS (SELECT 1 FROM jsonb_array_elements(fn_list_open_games(TRUE)) e
+                       WHERE (e->>'id')::bigint = v_game), 'полная партия не спрятана';
 
-    -- третий -> нет места (ED003)
-    BEGIN
-        PERFORM sp_join_game(v_third, v_game, NULL);
-        RAISE EXCEPTION 'ожидалось ED003';
-    EXCEPTION WHEN SQLSTATE 'ED003' THEN NULL;
-    END;
+    -- БД не проверяет заполненность: третий всё равно садится (это забота сервера)
+    ASSERT (sp_join_game(v_third, v_game)->>'player_id')::bigint > 0, 'вставка места не удалась';
+    ASSERT EXISTS (SELECT 1 FROM jsonb_array_elements(fn_get_game_state(v_game)->'players') e
+                   WHERE (e->>'id_player')::bigint = v_p2), 'нет игрока в снимке';
 
-    -- повторный join тем же гостем -> возврат на место
-    v := sp_join_game(v_guest, v_game, NULL);
-    ASSERT (v->>'returning')::boolean, 'повторный join не вернул на место';
-    ASSERT (v->>'player_id')::bigint = v_p2, 'вернулось не то место';
+    -- повторный join тем же гостем -> то же место
+    v := sp_join_game(v_guest, v_game);
+    ASSERT (v->>'player_id')::bigint = v_p2, 'повторный join не вернул на место';
 
     -- выход до старта: место освобождается
-    PERFORM sp_leave_game(v_p2, v_game);
-    ASSERT NOT EXISTS (SELECT 1 FROM players WHERE id_player = v_p2), 'место не освободилось';
+    PERFORM sp_leave_game(v_p2);
+    ASSERT NOT EXISTS (SELECT 1 FROM jsonb_array_elements(fn_get_player(v_guest)) e
+                       WHERE (e->>'id_player')::bigint = v_p2), 'место не освободилось';
 
-    -- снова есть слот
-    ASSERT EXISTS (
-        SELECT 1 FROM jsonb_array_elements(fn_list_open_games(TRUE, FALSE)) e
-        WHERE (e->>'id')::bigint = v_game), 'слот не вернулся';
+    -- смена максимума мест
+    PERFORM sp_set_game_seats(v_game, 4);
+    ASSERT (fn_get_game_state(v_game)->>'seats')::int = 4, 'места не обновились';
 
-    -- смена max_players меньше занятых -> ED004
+    -- схема всё ещё держит границы: 99 мест -> сырая ошибка CHECK
     BEGIN
-        PERFORM sp_update_game(v_game, v_host, NULL, 1, NULL);
-        RAISE EXCEPTION 'ожидалось ED004';
-    EXCEPTION WHEN SQLSTATE 'ED004' THEN NULL;
+        PERFORM sp_set_game_seats(v_game, 99);
+        RAISE EXCEPTION 'ожидалась ошибка CHECK';
+    EXCEPTION WHEN check_violation THEN NULL;
     END;
 
-    -- не хост меняет настройки -> ED002
-    BEGIN
-        PERFORM sp_update_game(v_game, v_guest, NULL, 3, NULL);
-        RAISE EXCEPTION 'ожидалось ED002';
-    EXCEPTION WHEN SQLSTATE 'ED002' THEN NULL;
-    END;
-
-    -- не хост отменяет -> ED002
-    BEGIN
-        PERFORM sp_cancel_game(v_game, v_guest);
-        RAISE EXCEPTION 'ожидалось ED002';
-    EXCEPTION WHEN SQLSTATE 'ED002' THEN NULL;
-    END;
-
-    -- хост меняет настройки: возвращается объект { game }
-    v := sp_update_game(v_game, v_host, 'игнор', 4, NULL);
-    ASSERT (v->'game'->>'name') = 'Партия #' || v_game, 'имя не синтетическое';
-    ASSERT (v->'game'->>'seats')::int = 4, 'места не обновились';
-    ASSERT (v->'game'->>'id')::bigint = v_game, 'id партии не тот';
+    -- отмена хостом: партия больше не читается
+    PERFORM sp_cancel_game(v_game);
+    ASSERT fn_get_game_state(v_game) IS NULL, 'партия не удалена';
 
     RAISE NOTICE 'lobby part 1 OK';
 END $$;
 
--- пароль
+-- пароль: его хранит БД, сравнивает сервер
 DO $$
 DECLARE
-    v_host  uuid := gen_random_uuid();
-    v_guest uuid := gen_random_uuid();
-    v       jsonb;
-    v_game  bigint;
+    v_host uuid := gen_random_uuid();
+    v      jsonb;
+    v_game bigint;
 BEGIN
-    v := sp_create_game(v_host, 'c паролем', 3, 'hash-1');
+    v := sp_create_game(v_host, 3, 'hash-1');
     v_game := (v->>'game_id')::bigint;
+    ASSERT fn_get_game_password(v_game) = 'hash-1', 'пароль не сохранён';
+    ASSERT (SELECT (e->>'needs_password')::boolean FROM jsonb_array_elements(fn_list_open_games(FALSE)) e
+            WHERE (e->>'id')::bigint = v_game), 'флаг пароля не выставлен';
 
-    -- без пароля -> ED002
-    BEGIN
-        PERFORM sp_join_game(v_guest, v_game, NULL);
-        RAISE EXCEPTION 'ожидалось ED002';
-    EXCEPTION WHEN SQLSTATE 'ED002' THEN NULL;
-    END;
+    -- замена и снятие пароля
+    PERFORM sp_set_game_password(v_game, 'hash-2');
+    ASSERT fn_get_game_password(v_game) = 'hash-2', 'пароль не заменён';
+    PERFORM sp_set_game_password(v_game, NULL);
+    ASSERT fn_get_game_password(v_game) IS NULL, 'пароль не снят';
+    ASSERT NOT (SELECT (e->>'needs_password')::boolean FROM jsonb_array_elements(fn_list_open_games(FALSE)) e
+                WHERE (e->>'id')::bigint = v_game), 'флаг пароля не снят';
 
-    -- неверный пароль -> ED002
-    BEGIN
-        PERFORM sp_join_game(v_guest, v_game, 'wrong');
-        RAISE EXCEPTION 'ожидалось ED002';
-    EXCEPTION WHEN SQLSTATE 'ED002' THEN NULL;
-    END;
-
-    -- верный пароль -> ок; до старта рука пуста (B2)
-    v := sp_join_game(v_guest, v_game, 'hash-1');
-    ASSERT v->>'player_id' IS NOT NULL, 'не пустило с верным паролем';
-    ASSERT jsonb_array_length(v->'hand') = 0, 'рука до старта не пуста';
-
-    -- возврат на своё место отдаёт руку (B2)
-    v := sp_join_game(v_guest, v_game, 'hash-1');
-    ASSERT (v->>'returning')::boolean, 'возврат не сработал';
-    ASSERT v->'hand' IS NOT NULL, 'возврат не отдал руку';
-
-    -- снять пароль (p_password_set = TRUE)
-    PERFORM sp_update_game(v_game, v_host, NULL, NULL, NULL, TRUE);
-    ASSERT NOT EXISTS (SELECT 1 FROM passwords WHERE id_game = v_game), 'пароль не снят';
-
-    -- поставить пароль отдельной функцией
-    PERFORM sp_set_game_password(v_game, v_host, 'hash-2');
-    ASSERT EXISTS (SELECT 1 FROM passwords WHERE id_game = v_game), 'пароль не поставлен';
-
-    -- PATCH настроек без p_password_set не трогает пароль (B3)
-    PERFORM sp_update_game(v_game, v_host, NULL, 2, NULL);
-    ASSERT (SELECT password_hash FROM passwords WHERE id_game = v_game) = 'hash-2',
-        'PATCH без password_set сбросил/сломал пароль';
-
-    -- снять пароль через отдельную функцию
-    PERFORM sp_set_game_password(v_game, v_host, NULL);
-    ASSERT NOT EXISTS (SELECT 1 FROM passwords WHERE id_game = v_game), 'пароль не снят отдельной функцией';
-
-    -- отмена хостом
-    PERFORM sp_cancel_game(v_game, v_host);
-    ASSERT NOT EXISTS (SELECT 1 FROM games WHERE id_game = v_game), 'партия не отменена';
-
-    -- max_players вне диапазона -> ED004
-    BEGIN
-        PERFORM sp_create_game(gen_random_uuid(), 'x', 7, NULL);
-        RAISE EXCEPTION 'ожидалось ED004';
-    EXCEPTION WHEN SQLSTATE 'ED004' THEN NULL;
-    END;
-
+    PERFORM sp_cancel_game(v_game);
     RAISE NOTICE 'lobby part 2 OK';
 END $$;
 

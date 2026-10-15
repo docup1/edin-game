@@ -1,164 +1,104 @@
--- 03: игровой цикл - старт, раздача, ход, доступные карты, цели, конец хода.
+-- 03: игровые примитивы - старт, раздача, перемещение карт, лог ходов, снимок.
+-- Чёрный ящик: только публичные fn_*/sp_*. БД - тупое хранилище: ходы, цели,
+-- победу и правила считает сервер; здесь только данные.
 BEGIN;
 
 DO $$
 DECLARE
     u1 uuid := gen_random_uuid();
     u2 uuid := gen_random_uuid();
-    r         jsonb;
-    v_game    bigint;
+    r  jsonb;
+    st jsonb;
+    v_game bigint;
     p1 bigint;
     p2 bigint;
-    t_uni     bigint;
-    t_destroy bigint;
-    t_protect bigint;
-    t_restrict bigint;
-    c_play    bigint;
-    c_target  bigint;
-    c_discard bigint;
+    t_uni bigint;
+    v_m_uni bigint;
+    c1 bigint;
+    c2 bigint;
 BEGIN
-    -- шаблоны под тест
-    INSERT INTO card_templates (card_name, card_description, img_link)
-    VALUES ('GP Uni', 'u', 'gp://uni') RETURNING id_card_template INTO t_uni;
-    INSERT INTO card_templates (card_name, card_description, img_link)
-    VALUES ('GP Destroy', 'd', 'gp://destroy') RETURNING id_card_template INTO t_destroy;
-    INSERT INTO card_templates (card_name, card_description, img_link)
-    VALUES ('GP Protect', 'p', 'gp://protect') RETURNING id_card_template INTO t_protect;
-    INSERT INTO card_templates (card_name, card_description, img_link)
-    VALUES ('GP Restrict', 'r', 'gp://restrict') RETURNING id_card_template INTO t_restrict;
+    SELECT (e->>'id')::bigint INTO v_m_uni
+      FROM jsonb_array_elements(fn_list_mechanics()) e WHERE e->>'code' = 'COUNT_AS_UNICORN';
+    r := sp_upsert_card_template(NULL, 'GP Uni', 'u', 'gp://uni');
+    t_uni := (r->>'id')::bigint;
+    PERFORM sp_set_card_mechanics(t_uni, ARRAY[v_m_uni]);
 
-    INSERT INTO template_mechanics (id_card_template, id_mechanic)
-      SELECT t_uni, id_mechanic FROM mechanics WHERE mechanic_name = 'COUNT_AS_UNICORN';
-    INSERT INTO template_mechanics (id_card_template, id_mechanic)
-      SELECT t_destroy, id_mechanic FROM mechanics
-       WHERE mechanic_name IN ('COUNT_AS_UNICORN', 'DESTROY_IN_STABLE');
-    INSERT INTO template_mechanics (id_card_template, id_mechanic)
-      SELECT t_protect, id_mechanic FROM mechanics WHERE mechanic_name = 'PROTECT_STABLE';
-    INSERT INTO template_mechanics (id_card_template, id_mechanic)
-      SELECT t_restrict, id_mechanic FROM mechanics WHERE mechanic_name = 'RESTRICT_CARD_PLAY';
-
-    -- лобби
-    r := sp_create_game(u1, 'gp', 2, NULL);
+    r := sp_create_game(u1, 2);
     v_game := (r->>'game_id')::bigint;
     p1     := (r->>'player_id')::bigint;
-    r := sp_join_game(u2, v_game, NULL);
-    p2 := (r->>'player_id')::bigint;
+    p2     := (sp_join_game(u2, v_game)->>'player_id')::bigint;
+    PERFORM sp_add_cards_to_game(v_game, t_uni, 3);
 
-    -- колода
-    PERFORM sp_add_cards_to_game(v_game, t_uni, 20);
-    PERFORM sp_add_cards_to_game(v_game, t_destroy, 4);
-    PERFORM sp_add_cards_to_game(v_game, t_protect, 2);
-    PERFORM sp_add_cards_to_game(v_game, t_restrict, 2);
+    -- снимок до старта
+    st := fn_get_game_state(v_game, p1);
+    ASSERT (st->>'game_id')::bigint = v_game, 'не тот game_id';
+    ASSERT (st->>'name') = 'Партия #' || v_game, 'имя не синтетическое';
+    ASSERT (st->>'seats')::int = 2, 'не те места';
+    ASSERT NOT (st->>'started')::boolean, 'партия уже началась';
+    ASSERT (st->>'deck_count')::int = 3, 'колода не 3';
+    ASSERT st->'discard' = '[]'::jsonb, 'сброс не пуст';
+    ASSERT st->'moves' = '[]'::jsonb, 'лог ходов не пуст';
+    ASSERT jsonb_array_length(st->'players') = 2, 'не 2 игрока';
+    ASSERT (st->'players'->0)->>'id_player' = p1::text, 'игроки не по move_order';
+    ASSERT (st->'players'->0)->'hand' = '[]'::jsonb, 'рука не пуста';
 
-    r := sp_start_game(v_game);
-    ASSERT _current_player(v_game) = p1, 'первым должен идти p1';
-    ASSERT _turn_number(v_game) = 1, 'номер хода должен быть 1';
-    ASSERT (SELECT count(*) FROM _cards_in_zone(v_game, 'hand', p1)) = 6, 'p1 должен добрать до 6';
-    ASSERT (SELECT count(*) FROM _cards_in_zone(v_game, 'hand', p2)) = 5, 'p2 должен иметь 5';
+    PERFORM sp_set_game_started(v_game, TRUE);
+    ASSERT (fn_get_game_state(v_game)->>'started')::boolean, 'флаг старта не поднялся';
 
-    -- возврат на место после старта отдаёт реальную руку (B2)
-    r := sp_join_game(u2, v_game, NULL);
-    ASSERT (r->>'returning')::boolean, 'возврат после старта не сработал';
-    ASSERT jsonb_array_length(r->'hand') = 5, 'рука после старта не пришла';
+    -- раздача: карта уходит из колоды в руку
+    c1 := sp_draw(v_game, p1);
+    ASSERT c1 IS NOT NULL, 'карта не вытянулась';
+    st := fn_get_game_state(v_game, p1);
+    ASSERT (st->>'deck_count')::int = 2, 'колода не уменьшилась';
+    ASSERT (st->'players'->0)->>'hand_count' = '1', 'рука не выросла';
+    ASSERT (st->'players'->0)->'hand'->0->>'card_id' = c1::text, 'не та карта в руке';
 
-    -- добавить карты после старта -> ED003
-    BEGIN PERFORM sp_add_cards_to_game(v_game, t_uni, 1); RAISE EXCEPTION 'ожидалось ED003';
-    EXCEPTION WHEN SQLSTATE 'ED003' THEN NULL; END;
+    -- рука видна только запрошенному игроку
+    ASSERT (st->'players'->1)->'hand' = 'null'::jsonb, 'чужая рука не скрыта';
+    st := fn_get_game_state(v_game, p2);
+    ASSERT (st->'players'->1)->'hand' = '[]'::jsonb, 'своя рука не отдана';
 
-    -- неверный номер хода -> ED003
-    BEGIN
-        PERFORM sp_apply_event(v_game, 99, 'x', 'discard',
-            (SELECT min(id_card) FROM cards WHERE id_game = v_game), NULL);
-        RAISE EXCEPTION 'ожидалось ED003';
-    EXCEPTION WHEN SQLSTATE 'ED003' THEN NULL; END;
+    -- рука -> стойло: карта и её механики видны в стойле
+    PERFORM sp_move_card(p1, c1, 'stable');
+    st := fn_get_game_state(v_game, p1);
+    ASSERT jsonb_array_length((st->'players'->0)->'stable') = 1, 'стабил не пополнился';
+    ASSERT (st->'players'->0)->'stable'->0->>'card_id' = c1::text, 'не та карта в стойле';
+    ASSERT (st->'players'->0)->'stable'->0->'mechanics' @> to_jsonb(ARRAY['COUNT_AS_UNICORN']),
+        'механики карты не видны в стойле';
+    ASSERT (st->'players'->0)->>'hand_count' = '0', 'рука не опустела';
 
-    -- карты нет в руке текущего игрока -> ED004
-    BEGIN
-        PERFORM sp_apply_event(v_game, 1, 'x', 'discard',
-            (SELECT c.id_card FROM cards c
-              WHERE c.id_game = v_game
-                AND NOT EXISTS (SELECT 1 FROM _cards_in_zone(v_game, 'hand', p1) h WHERE h = c.id_card)
-              LIMIT 1), NULL);
-        RAISE EXCEPTION 'ожидалось ED004';
-    EXCEPTION WHEN SQLSTATE 'ED004' THEN NULL; END;
+    -- рука -> сброс
+    c2 := sp_draw(v_game, p1);
+    PERFORM sp_move_card(p1, c2, 'discard');
+    st := fn_get_game_state(v_game);
+    ASSERT jsonb_array_length(st->'discard') = 1, 'сброс не пополнился';
+    ASSERT st->'discard'->0->>'card_id' = c2::text, 'не та карта в сбросе';
+    ASSERT jsonb_array_length((st->'players'->0)->'stable') = 1, 'стойло пострадало';
 
-    -- сыграть единорога -> стойло
-    SELECT h AS id_card INTO c_play FROM _cards_in_zone(v_game, 'hand', p1) AS h
-      JOIN cards c ON c.id_card = h
-     WHERE c.id_card_template = t_uni LIMIT 1;
-    PERFORM sp_apply_event(v_game, 1, 'play1', 'play', c_play, NULL);
-    ASSERT (_player_status(p1)->>'unicorns')::int = 1, 'единорог не засчитан';
-    ASSERT EXISTS (SELECT 1 FROM _cards_in_zone(v_game, 'stable', p1) s WHERE s = c_play), 'карта не в стойле';
-    ASSERT (SELECT count(*) FROM _cards_in_zone(v_game, 'hand', p1)) = 5, 'рука не уменьшилась';
+    -- лог завершённых ходов
+    PERFORM sp_record_move(p1);
+    PERFORM sp_record_move(p1);
+    PERFORM sp_record_move(p2);
+    st := fn_get_game_state(v_game);
+    ASSERT jsonb_array_length(st->'moves') = 3, 'лог ходов неполон';
+    ASSERT (SELECT array_agg((m->>'move_number')::int ORDER BY (m->>'move_number')::int)
+            FROM jsonb_array_elements(st->'moves') m WHERE (m->>'id_player')::bigint = p1) = ARRAY[1, 2],
+        'нумерация ходов игрока сбита';
 
-    -- сброс карты из руки
-    SELECT h AS id_card INTO c_discard FROM _cards_in_zone(v_game, 'hand', p1) AS h LIMIT 1;
-    PERFORM sp_apply_event(v_game, 1, 'disc1', 'discard', c_discard, NULL);
-    ASSERT (SELECT count(*) FROM _cards_in_zone(v_game, 'hand', p1)) = 4, 'рука после сброса не 4';
-    ASSERT EXISTS (SELECT 1 FROM discard WHERE id_card = c_discard), 'карта не в сбросе';
+    -- пустая колода -> NULL, а не ошибка
+    PERFORM sp_draw(v_game, p1);
+    ASSERT (fn_get_game_state(v_game)->>'deck_count')::int = 0, 'колода не пуста';
+    ASSERT sp_draw(v_game, p1) IS NULL, 'пустая колода не вернула NULL';
 
-    -- защита стойла (карту кладём напрямую, чтобы тест не зависел от случайной раздачи)
-    INSERT INTO cards (id_game, id_card_template) VALUES (v_game, t_protect)
-      RETURNING id_card INTO c_play;
-    INSERT INTO player_cards (id_player, id_card, is_public) VALUES (p1, c_play, TRUE);
-    ASSERT (_player_status(p1)->>'protected')::boolean, 'защита не видна';
+    -- в игре выход сохраняет место, рука уходит в сброс
+    PERFORM sp_add_cards_to_game(v_game, t_uni, 2);
+    PERFORM sp_draw(v_game, p2);
+    PERFORM sp_leave_game(p2);
+    st := fn_get_game_state(v_game);
+    ASSERT jsonb_array_length(st->'players') = 2, 'в игре место не сохранилось';
+    ASSERT jsonb_array_length(st->'discard') = 2, 'рука выходящего не в сбросе';
 
-    -- уничтожение: карта-разрушитель в руке p1 и цель в стойле p2
-    INSERT INTO cards (id_game, id_card_template) VALUES (v_game, t_destroy)
-      RETURNING id_card INTO c_play;
-    INSERT INTO player_cards (id_player, id_card, is_public) VALUES (p1, c_play, FALSE);
-
-    INSERT INTO cards (id_game, id_card_template) VALUES (v_game, t_uni)
-      RETURNING id_card INTO c_target;
-    INSERT INTO player_cards (id_player, id_card, is_public) VALUES (p2, c_target, TRUE);
-
-    -- без цели -> ED004
-    BEGIN PERFORM sp_apply_event(v_game, 1, 'd0', 'play', c_play, NULL); RAISE EXCEPTION 'ожидалось ED004';
-    EXCEPTION WHEN SQLSTATE 'ED004' THEN NULL; END;
-
-    -- цель - не чужое стойло -> ED004
-    BEGIN PERFORM sp_apply_event(v_game, 1, 'd1', 'play', c_play, c_play); RAISE EXCEPTION 'ожидалось ED004';
-    EXCEPTION WHEN SQLSTATE 'ED004' THEN NULL; END;
-
-    -- корректная цель
-    PERFORM sp_apply_event(v_game, 1, 'd2', 'play', c_play, c_target);
-    ASSERT EXISTS (SELECT 1 FROM discard WHERE id_card = c_target), 'цель не в сбросе';
-    ASSERT NOT EXISTS (SELECT 1 FROM player_cards WHERE id_card = c_target AND is_public),
-        'цель осталась в стойле';
-    ASSERT EXISTS (SELECT 1 FROM _cards_in_zone(v_game, 'stable', p1) s WHERE s = c_play), 'разрушитель не в стойле p1';
-
-    -- конец хода -> p2 (внутри сам пересчитывает стойла и открывает следующий)
-    PERFORM sp_end_turn(v_game, 1);
-    ASSERT _current_player(v_game) = p2, 'ход не перешёл к p2';
-    ASSERT _turn_number(v_game) = 2, 'номер хода не 2';
-    ASSERT (SELECT count(*) FROM _cards_in_zone(v_game, 'hand', p2)) = 6, 'p2 не добрал карту';
-
-    -- устаревший номер хода на end_turn -> ED003
-    BEGIN PERFORM sp_end_turn(v_game, 1); RAISE EXCEPTION 'ожидалось ED003';
-    EXCEPTION WHEN SQLSTATE 'ED003' THEN NULL; END;
-
-    -- конец хода p2 -> p1
-    PERFORM sp_end_turn(v_game, 2);
-    ASSERT _current_player(v_game) = p1, 'ход не вернулся к p1';
-    ASSERT _turn_number(v_game) = 3, 'номер хода не 3';
-
-    -- запрет розыгрыша (RESTRICT_CARD_PLAY)
-    INSERT INTO cards (id_game, id_card_template) VALUES (v_game, t_restrict)
-      RETURNING id_card INTO c_play;
-    INSERT INTO player_cards (id_player, id_card, is_public) VALUES (p1, c_play, TRUE);
-    ASSERT (_player_status(p1)->>'restricted')::boolean, 'запрет не виден';
-    ASSERT jsonb_array_length(_available(v_game, p1)) = 0, 'available не пуст при запрете';
-    SELECT h AS id_card INTO c_discard FROM _cards_in_zone(v_game, 'hand', p1) AS h LIMIT 1;
-    BEGIN PERFORM sp_apply_event(v_game, 3, 'r1', 'play', c_discard, NULL); RAISE EXCEPTION 'ожидалось ED004';
-    EXCEPTION WHEN SQLSTATE 'ED004' THEN NULL; END;
-
-    -- пропуск хода реально сдвигает очередь и пишется в лог (B4/B5)
-    ASSERT _current_player(v_game) = p1, 'перед пропуском ход должен быть у p1';
-    r := sp_begin_turn(v_game, p1);
-    ASSERT _current_player(v_game) = p2, 'skip_player не сдвинул ход';
-    ASSERT _turn_number(v_game) = 4, 'пропуск не записан в лог ходов';
-    ASSERT (r->>'skipped')::boolean, 'пропуск не отмечен в ответе';
-
+    PERFORM sp_cancel_game(v_game);
     RAISE NOTICE 'gameplay OK';
 END $$;
 

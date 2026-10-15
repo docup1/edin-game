@@ -29,7 +29,7 @@ sequenceDiagram
 
     H->>C: Поменять настройки
     C->>S: PATCH /api/games/{game_id}<br/>имя, сколько игроков<br/>пароль + password_set?
-    S->>D: Вызвать sp_update_game
+    S->>D: Вызвать sp_set_game_seats и/или sp_set_game_password
     D-->>S: Объект { game }
     S-->>C: 200 { game }, при ошибке 401 / 403 / 404 / 409
 
@@ -57,8 +57,8 @@ sequenceDiagram
     H->>C: Нажать «Начать игру»
     C->>S: POST /api/games/{game_id}/start
     S->>K: Отметить вызвавшего готовым
-    S->>D: Вызвать sp_start_game (сам открывает первый ход)
-    D-->>S: id партии и первый открытый ход
+    S->>D: Вызвать sp_set_game_started и раздать карты через sp_draw
+    D-->>S: Партия начата
     S->>K: Записать, чей сейчас ход
     S-->>C: 200 { game_id, first }, при ошибке 401 / 403 / 404 / 409
     S->>C: Состояние партии уходит в общий поток
