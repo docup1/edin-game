@@ -19,8 +19,8 @@ sequenceDiagram
 
     A->>C: Заводит новую карту
     C->>S: POST /api/admin/cards<br/>название<br/>описание<br/>ссылка на картинку
-    S->>D: Вызвать sp_create_card_template
-    D-->>S: id шаблона
+    S->>D: Вызвать sp_upsert_card_template без id
+    D-->>S: Объект шаблона
     S-->>C: 201 { template_id }, при ошибке 409 / 422
 
     A->>C: Назначает механики
@@ -35,7 +35,7 @@ sequenceDiagram
 
     A->>C: Правит описание
     C->>S: PATCH /api/admin/cards/{template_id}<br/>любые из:<br/>название<br/>описание<br/>ссылка на картинку
-    S->>D: Вызвать sp_update_card_template
+    S->>D: Вызвать sp_upsert_card_template с id
     D-->>S: Обновлено
     S->>D: Вызвать fn_get_card_template
     D-->>S: Шаблон с механиками

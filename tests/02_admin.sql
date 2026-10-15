@@ -14,13 +14,13 @@ BEGIN
     SELECT id_mechanic INTO v_m_draw FROM mechanics WHERE mechanic_name = 'DRAW_FROM_DECK';
 
     -- создание
-    v := sp_create_card_template('Админ-карта', 'описание', 'admt://x');
-    v_tpl := (v->>'template_id')::bigint;
+    v := sp_upsert_card_template(NULL, 'Админ-карта', 'описание', 'admt://x');
+    v_tpl := (v->>'id')::bigint;
     ASSERT v_tpl > 0, 'шаблон не создан';
 
     -- дубль картинки -> ED003
     BEGIN
-        PERFORM sp_create_card_template('Другая', 'o', 'admt://x');
+        PERFORM sp_upsert_card_template(NULL, 'Другая', 'o', 'admt://x');
         RAISE EXCEPTION 'ожидалось ED003';
     EXCEPTION WHEN SQLSTATE 'ED003' THEN NULL;
     END;
@@ -47,7 +47,7 @@ BEGIN
     END;
 
     -- правка
-    v := sp_update_card_template(v_tpl, 'Админ-карта 2', NULL, NULL);
+    v := sp_upsert_card_template(v_tpl, 'Админ-карта 2', NULL, NULL);
     ASSERT v->>'name' = 'Админ-карта 2', 'правка не применилась';
 
     -- поиск по имени

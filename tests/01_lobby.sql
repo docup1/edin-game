@@ -127,7 +127,7 @@ BEGIN
     ASSERT NOT EXISTS (SELECT 1 FROM passwords WHERE id_game = v_game), 'пароль не снят';
 
     -- поставить пароль отдельной функцией
-    PERFORM sp_set_game_password(v_game, 'hash-2');
+    PERFORM sp_update_game(v_game, v_host, NULL, NULL, 'hash-2');
     ASSERT EXISTS (SELECT 1 FROM passwords WHERE id_game = v_game), 'пароль не поставлен';
 
     -- отмена хостом

@@ -31,7 +31,7 @@ sequenceDiagram
     C-->>U: Готово
 
     C->>S: GET /api/catalog
-    S->>D: Вызвать fn_get_catalog
+    S->>D: Вызвать fn_list_card_templates без фильтра
     D-->>S: Все шаблоны: название, описание, картинка, механики
     S-->>C: 200 { templates }
 

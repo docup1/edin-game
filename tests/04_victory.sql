@@ -35,7 +35,7 @@ BEGIN
         INSERT INTO player_cards (id_player, id_card, is_public) VALUES (p1, rec.id_card, TRUE);
     END LOOP;
 
-    ASSERT _player_unicorns(p1) = 7, 'не 7 единорогов';
+    ASSERT (_player_status(p1)->>'unicorns')::int = 7, 'не 7 единорогов';
     v := fn_check_victory(v_game);
     ASSERT v->>'reason' = 'unicorns', 'нет победы по единорогам';
     ASSERT (v->>'winner')::bigint = p1, 'не тот победитель';
@@ -80,7 +80,7 @@ BEGIN
         INSERT INTO player_cards (id_player, id_card, is_public) VALUES (p1, rec.id_card, TRUE);
     END LOOP;
 
-    ASSERT _player_unicorns(p1) = 6, 'не 6 единорогов';
+    ASSERT (_player_status(p1)->>'unicorns')::int = 6, 'не 6 единорогов';
     v := fn_check_victory(v_game);
     ASSERT v->>'reason' = 'unicorns', 'порог 6 не сработал';
     ASSERT (v->>'winner')::bigint = p1, 'не тот победитель (6 игроков)';

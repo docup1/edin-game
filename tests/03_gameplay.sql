@@ -82,7 +82,7 @@ BEGIN
       JOIN cards c ON c.id_card = h
      WHERE c.id_card_template = t_uni LIMIT 1;
     PERFORM sp_apply_event(v_game, 1, 'play1', 'play', c_play, NULL);
-    ASSERT _player_unicorns(p1) = 1, 'единорог не засчитан';
+    ASSERT (_player_status(p1)->>'unicorns')::int = 1, 'единорог не засчитан';
     ASSERT EXISTS (SELECT 1 FROM _cards_in_zone(v_game, 'stable', p1) s WHERE s = c_play), 'карта не в стойле';
     ASSERT (SELECT count(*) FROM _cards_in_zone(v_game, 'hand', p1)) = 5, 'рука не уменьшилась';
 
@@ -96,7 +96,7 @@ BEGIN
     INSERT INTO cards (id_game, id_card_template) VALUES (v_game, t_protect)
       RETURNING id_card INTO c_play;
     INSERT INTO player_cards (id_player, id_card, is_public) VALUES (p1, c_play, TRUE);
-    ASSERT _is_protected(p1), 'защита не видна';
+    ASSERT (_player_status(p1)->>'protected')::boolean, 'защита не видна';
 
     -- уничтожение: карта-разрушитель в руке p1 и цель в стойле p2
     INSERT INTO cards (id_game, id_card_template) VALUES (v_game, t_destroy)
@@ -141,7 +141,7 @@ BEGIN
     INSERT INTO cards (id_game, id_card_template) VALUES (v_game, t_restrict)
       RETURNING id_card INTO c_play;
     INSERT INTO player_cards (id_player, id_card, is_public) VALUES (p1, c_play, TRUE);
-    ASSERT _is_restricted(p1), 'запрет не виден';
+    ASSERT (_player_status(p1)->>'restricted')::boolean, 'запрет не виден';
     ASSERT jsonb_array_length(_available(v_game, p1)) = 0, 'available не пуст при запрете';
     SELECT h AS id_card INTO c_discard FROM _cards_in_zone(v_game, 'hand', p1) AS h LIMIT 1;
     BEGIN PERFORM sp_apply_event(v_game, 3, 'r1', 'play', c_discard, NULL); RAISE EXCEPTION 'ожидалось ED004';
