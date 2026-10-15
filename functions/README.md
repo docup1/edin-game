@@ -5,10 +5,9 @@
 | Домен | Файл | Что внутри |
 |---|---|---|
 | Внутренние хелперы | [`helpers.md`](helpers.md) | 21 служебная `_*` (перемещение карт, ход, триггеры, эффекты) |
-| Логин и каталог | [`auth.md`](auth.md) | Публичные чтения `fn_list_mechanics`, `fn_list_card_templates` |
-| Лобби | [`lobby.md`](lobby.md) | `fn_get_player`, `fn_list_open_games` и настройки партии |
+| Лобби | [`lobby.md`](lobby.md) | Список партий, создание/вход/выход, настройки |
 | Игра | [`game.md`](game.md) | Снимок состояния, победа, старт и ход |
-| Админка | [`admin.md`](admin.md) | Библиотека карт: шаблоны, механики, наполнение колод |
+| Админка и каталог | [`admin.md`](admin.md) | Справочник механик, каталог шаблонов, наполнение колод |
 
 Коды ошибок (`SQLSTATE` → HTTP на сервере): `ED001`→404, `ED002`→403, `ED003`→409, `ED004`→422.
 
@@ -43,8 +42,8 @@
 | 23 | [`fn_list_open_games`](../db/20_functions.sql#L523) | [lobby](lobby.md) |
 | 24 | [`fn_get_game_state`](../db/20_functions.sql#L545) | [game](game.md) |
 | 25 | [`fn_check_victory`](../db/20_functions.sql#L620) | [game](game.md) |
-| 26 | [`fn_list_mechanics`](../db/20_functions.sql#L674) | [auth](auth.md) |
-| 27 | [`fn_list_card_templates`](../db/20_functions.sql#L708) | [auth](auth.md) |
+| 26 | [`fn_list_mechanics`](../db/20_functions.sql#L674) | [admin](admin.md) |
+| 27 | [`fn_list_card_templates`](../db/20_functions.sql#L708) | [admin](admin.md) |
 | 28 | [`fn_get_card_template`](../db/20_functions.sql#L733) | [admin](admin.md) |
 | 29 | [`sp_upsert_card_template`](../db/20_functions.sql#L759) | [admin](admin.md) |
 | 30 | [`sp_set_card_mechanics`](../db/20_functions.sql#L791) | [admin](admin.md) |
