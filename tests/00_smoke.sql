@@ -5,7 +5,7 @@ DECLARE
 BEGIN
     FOR r IN SELECT * FROM (VALUES
         ('fn_get_player(uuid)'),
-        ('fn_list_open_games(boolean,boolean,uuid)'),
+        ('fn_list_open_games(boolean,boolean,uuid,text)'),
         ('fn_get_game_state(bigint,bigint)'),
         ('fn_check_victory(bigint)'),
         ('fn_list_mechanics()'),

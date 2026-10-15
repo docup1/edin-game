@@ -31,6 +31,14 @@ BEGIN
         SELECT 1 FROM jsonb_array_elements(fn_list_open_games(FALSE, TRUE, v_third)) e
         WHERE (e->>'id')::bigint = v_game), 'чужая партия видна в mine';
 
+    -- search: по номеру партии находит, чужой номер не находит
+    ASSERT EXISTS (
+        SELECT 1 FROM jsonb_array_elements(fn_list_open_games(TRUE, FALSE, NULL, v_game::text)) e
+        WHERE (e->>'id')::bigint = v_game), 'search не нашёл партию по номеру';
+    ASSERT NOT EXISTS (
+        SELECT 1 FROM jsonb_array_elements(fn_list_open_games(TRUE, FALSE, NULL, (v_game + 999)::text)) e
+        WHERE (e->>'id')::bigint = v_game), 'search нашёл лишнее';
+
     -- заходим вторым
     v := sp_join_game(v_guest, v_game, NULL);
     v_p2 := (v->>'player_id')::bigint;
