@@ -84,9 +84,11 @@ BEGIN
     EXCEPTION WHEN SQLSTATE 'ED002' THEN NULL;
     END;
 
-    -- хост меняет настройки
+    -- хост меняет настройки: возвращается объект { game }
     v := sp_update_game(v_game, v_host, 'игнор', 4, NULL);
-    ASSERT (v->>'name') = 'Партия #' || v_game, 'имя не синтетическое';
+    ASSERT (v->'game'->>'name') = 'Партия #' || v_game, 'имя не синтетическое';
+    ASSERT (v->'game'->>'seats')::int = 4, 'места не обновились';
+    ASSERT (v->'game'->>'id')::bigint = v_game, 'id партии не тот';
 
     RAISE NOTICE 'lobby part 1 OK';
 END $$;

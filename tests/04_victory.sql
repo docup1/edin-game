@@ -130,9 +130,9 @@ BEGIN
     INSERT INTO discard (id_card, position)
     SELECT d AS id_card,
            (SELECT COALESCE(max(position), 0) FROM discard) + row_number() OVER ()
-    FROM _deck_card_ids(v_game) d;
+    FROM _cards_in_zone(v_game, 'deck') d;
 
-    ASSERT (SELECT count(*) FROM _deck_card_ids(v_game)) = 0, 'колода не пуста';
+    ASSERT (SELECT count(*) FROM _cards_in_zone(v_game, 'deck')) = 0, 'колода не пуста';
 
     v := fn_check_victory(v_game);
     ASSERT v->>'reason' = 'deck_empty', 'нет тай-брейка пустой колоды';

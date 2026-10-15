@@ -7,9 +7,9 @@
 | `_mechanic_description` | `p_name mechanic_name_enum` | `text` | Возвращает человекочитаемое описание механики по её enum-значению | Наполняет справочник механик (`fn_list_mechanics`) |
 | `_game_lock` | `p_id_game bigint` | `void` | Берёт строку партии под `FOR UPDATE`; если партии нет — `ED001` | Сериализует конкурентные изменения одной партии |
 | `_game_started` | `p_id_game bigint` | `boolean` | Читает `games.move_status` | Единая проверка «партия уже началась» |
-| `_deck_card_ids` | `p_id_game bigint` | `SETOF bigint` | Возвращает id карт в колоде (есть в `cards`, нет в `player_cards` и `discard`) | Определение колоды и подсчёт остатка |
-| `_hand` | `p_id_player bigint` | `SETOF bigint` | Возвращает id карт в руке (`player_cards.is_public = FALSE`) | Работа с рукой игрока |
-| `_stable` | `p_id_player bigint` | `SETOF bigint` | Возвращает id карт в стойле (`player_cards.is_public = TRUE`) | Работа со стойлом игрока |
+| `_zone_of` | `p_id_card bigint` | `text` | Где карта лежит сейчас: `stable`/`hand`/`discard`/`deck` | Универсальный запрос зоны карты |
+| `_cards_in_zone` | `p_id_game bigint, p_zone text, p_id_player bigint DEFAULT NULL` | `SETOF bigint` | Универсальный список карт зоны: `hand`/`stable` (для игрока), `deck` (остаток колоды), `discard` (сброс партии) | Один примитив вместо `_hand`/`_stable`/`_deck_card_ids` |
+| `_move_card` | `p_id_player bigint, p_id_card bigint, p_zone text` | `void` | Универсальное перемещение карты в `hand`/`stable`/`deck`/`discard` без запуска leave-триггера | Один примитив вместо `_to_hand`/`_to_stable`/`_to_deck`/`_discard_card` |
 | `_card_mechanics` | `p_id_card bigint` | `SETOF mechanic_name_enum` | Возвращает механики карты через её шаблон (`template_mechanics`) | Проверка и применение эффектов карты |
 | `_has_mechanic` | `p_id_card bigint, p_name mechanic_name_enum` | `boolean` | Есть ли у карты указанная механика | Условия на механики (победа, защита, триггеры) |
 | `_player_unicorns` | `p_id_player bigint` | `int` | Считает карты в стойле с механикой `COUNT_AS_UNICORN` | Определение победителя и тай-брейк |
@@ -22,11 +22,7 @@
 | `_turn_number` | `p_id_game bigint` | `int` | Номер открытого хода = `count(moves по игре) + 1` | Проверка актуальности хода и счётчик |
 | `_notify` | `p_id_game bigint, p_event text` | `void` | Шлёт `pg_notify` в канал `edin_game` с id партии и событием | Реалтайм-оповещение сервера/клиентов |
 | `_trigger_depth` | — | `int` | Возвращает текущую глубину каскада триггеров из `edin.trigger_depth` | Защита от бесконечной рекурсии триггеров |
-| `_to_hand` | `p_id_player bigint, p_id_card bigint` | `void` | Убирает карту из `player_cards`/`discard` и кладёт в руку игрока | Перемещение карты в руку |
-| `_to_stable` | `p_id_player bigint, p_id_card bigint` | `void` | Убирает карту из `player_cards`/`discard` и кладёт в стойло | Перемещение карты в стойло |
-| `_to_deck` | `p_id_card bigint` | `void` | Убирает карту из `player_cards`/`discard` | Возврат карты в колоду |
-| `_fire_leave_stable` | `p_id_card bigint` | `void` | Запускает `TRIGGER_ON_LEAVE_STABLE` при выходе карты из стойла (лимит глубины 5) | Срабатывание «выход из стойла» |
-| `_discard_card` | `p_id_card bigint, p_fire_leave boolean DEFAULT TRUE` | `void` | Отправляет карту в сброс (опц. с триггером выхода из стойла) | Универсальный сброс карты |
+| `_fire_leave_stable` | `p_id_card bigint` | `void` | Запускает `TRIGGER_ON_LEAVE_STABLE` при выходе карты из стойла (лимит глубины 5) | Срабатывание «выход из стойла» (зовётся явно только на DESTROY/SACRIFICE) |
 | `_draw` | `p_id_game bigint, p_id_player bigint` | `bigint` | Берёт случайную карту из колоды в руку; `NULL`, если колода пуста | Добор карт |
 | `_apply_active_mechanics` | `p_id_game bigint, p_actor bigint, p_id_card bigint, p_target bigint, p_lenient boolean` | `void` | Применяет активные механики карты (DRAW/DISCARD/SACRIFICE/DESTROY/STEAL/SEARCH/SHUFFLE/SKIP); в lenient-режиме ошибки — только warning | Исполнение эффектов карты |
 | `_final_zone` | `p_id_card bigint` | `text` | По `MOVE_TO_*` определяет итоговую зону (`stable`/`deck`/`hand`/`discard`) | Куда положить сыгранную карту |
@@ -35,7 +31,7 @@
 | `fn_get_player` | `p_user_id uuid` | `jsonb` | Возвращает места пользователя (партия, `id_player`, порядок, хост) | Определить, в каких партиях пользователь |
 | `fn_list_open_games` | `p_has_slot boolean DEFAULT TRUE, p_mine boolean DEFAULT FALSE, p_id_user uuid DEFAULT NULL` | `jsonb` | Список партий; фильтр по свободным местам и по «только мои» | Экран лобби |
 | `fn_get_catalog` | — | `jsonb` | Все шаблоны карт с их механиками | Каталог карт |
-| `fn_get_available` | `p_id_game bigint, p_id_player bigint` | `jsonb` | Карты руки, доступные к розыгрышу, с флагом цели и списком целей; пусто, если не ваш ход или есть RESTRICT | Подсказка «что можно сыграть» |
+| `_available` | `p_id_game bigint, p_id_player bigint` | `jsonb` | Карты руки, доступные к розыгрышу, с флагом цели и списком целей; пусто, если не ваш ход или есть RESTRICT (приватный, отдаётся внутри `fn_get_game_state`) | Подсказка «что можно сыграть» |
 | `fn_get_game_state` | `p_id_game bigint, p_id_player bigint DEFAULT NULL` | `jsonb` | Полное состояние: ход, текущий игрок, колода, сброс, игроки со стойлами, победа; плюс рука/доступные для конкретного игрока | Основной снимок игры для клиента |
 | `fn_check_victory` | `p_id_game bigint` | `jsonb` | Победа по единорогам (порог 7 при 2–5 игроках, 6 при 6); при пустой колоде — тай-брейк по единорогам, затем по длине имён | Определение победителя |
 | `fn_list_mechanics` | — | `jsonb` | Справочник механик (id, код, тип, описание) | Данные для админки |
@@ -55,7 +51,7 @@
 | `sp_start_game` | `p_id_game bigint` | `jsonb` | Раздаёт по 5 карт (первому при открытии хода — 6), ставит `move_status`, открывает ход; повторный старт/мало игроков → `ED003`, мало карт → `ED004` | Начало игры |
 | `sp_begin_turn` | `p_id_game bigint, p_skip_player bigint DEFAULT NULL` | `jsonb` | Открывает ход: определяет игрока (пропуская `p_skip_player`), добирает карту, запускает turn-start, отдаёт `available`; не началась → `ED003` | Открытие хода |
 | `sp_skip_turn` | `p_id_game bigint` | `jsonb` | Фиксирует ход за текущим игроком и сразу открывает следующий; не началась → `ED003` | Пропуск хода |
-| `sp_apply_event` | `p_id_game bigint, p_id_player bigint, p_turn int, p_request_id text, p_do text, p_id_card bigint, p_target bigint DEFAULT NULL` | `jsonb` | Разыгрывает или сбрасывает карту с проверками (ход, владелец, действие, цель); не тот ход → `ED002`, чужой/устаревший ход → `ED003`, плохие аргументы → `ED004` | Игровое действие |
-| `sp_end_turn` | `p_id_game bigint, p_id_player bigint, p_turn int` | `jsonb` | Завершает ход: автосброс лишних (>7), фиксирует ход, resolve эффектов, открывает следующий ход и проверяет победу; не тот ход → `ED002`, устаревший ход → `ED003` | Конец хода |
+| `sp_apply_event` | `p_id_game bigint, p_turn int, p_request_id text, p_do text, p_id_card bigint, p_target bigint DEFAULT NULL` | `void` | Разыгрывает или сбрасывает карту текущего игрока с проверками (номер хода, карта в руке, действие, цель). Актор не передаётся — это всегда текущий игрок; «не его ход» проверяет сервер. Устаревший номер хода → `ED003`, карты нет в руке → `ED004`, не участник партии → `ED002` | Игровое действие (204) |
+| `sp_end_turn` | `p_id_game bigint, p_turn int` | `void` | Завершает ход текущего игрока: автосброс лишних (>7), фиксирует ход, внутри зовёт `sp_resolve_stable_effects`, затем `sp_begin_turn`; устаревший ход → `ED003` | Конец хода (204) |
 | `sp_resolve_stable_effects` | `p_id_game bigint` | `jsonb` | Сводка эффектов по игрокам (protected/restricted/unicorns) | Пересчёт длительных эффектов конца хода |
 | `sp_fire_turn_start` | `p_id_player bigint` | `void` | Вручную запускает turn-start триггеры игрока; нет игрока → `ED001` | Повторный запуск эффектов «начало хода» |

@@ -7,7 +7,6 @@ BEGIN
         ('fn_get_player(uuid)'),
         ('fn_list_open_games(boolean,boolean,uuid)'),
         ('fn_get_catalog()'),
-        ('fn_get_available(bigint,bigint)'),
         ('fn_get_game_state(bigint,bigint)'),
         ('fn_check_victory(bigint)'),
         ('fn_list_mechanics()'),
@@ -27,8 +26,8 @@ BEGIN
         ('sp_start_game(bigint)'),
         ('sp_begin_turn(bigint,bigint)'),
         ('sp_skip_turn(bigint)'),
-        ('sp_apply_event(bigint,bigint,integer,text,text,bigint,bigint)'),
-        ('sp_end_turn(bigint,bigint,integer)'),
+        ('sp_apply_event(bigint,integer,text,text,bigint,bigint)'),
+        ('sp_end_turn(bigint,integer)'),
         ('sp_resolve_stable_effects(bigint)'),
         ('sp_fire_turn_start(bigint)')
     ) AS t(sig)
