@@ -40,6 +40,14 @@ BEGIN
     ASSERT v->>'reason' = 'unicorns', 'нет победы по единорогам';
     ASSERT (v->>'winner')::bigint = p1, 'не тот победитель';
 
+    -- после победы ход и события не принимаются (B6)
+    BEGIN PERFORM sp_end_turn(v_game, _turn_number(v_game)); RAISE EXCEPTION 'ожидалось ED003';
+    EXCEPTION WHEN SQLSTATE 'ED003' THEN NULL; END;
+    BEGIN PERFORM sp_apply_event(v_game, _turn_number(v_game), 'x', 'discard',
+        (SELECT min(id_card) FROM player_cards WHERE id_player = p1), NULL);
+        RAISE EXCEPTION 'ожидалось ED003';
+    EXCEPTION WHEN SQLSTATE 'ED003' THEN NULL; END;
+
     RAISE NOTICE 'victory 2p OK';
 END $$;
 
@@ -140,6 +148,41 @@ BEGIN
     ASSERT (v->>'count')::int = 2, 'неверный счёт у победителя';
 
     RAISE NOTICE 'victory deck_empty OK';
+END $$;
+
+-- до старта победы нет (B1)
+DO $$
+DECLARE
+    u1 uuid := gen_random_uuid();
+    t_uni bigint;
+    v_game bigint;
+    p1 bigint;
+    r jsonb;
+    rec record;
+BEGIN
+    INSERT INTO card_templates (card_name, card_description, img_link)
+    VALUES ('VC Uni Pre', 'u', 'vc://uni-pre') RETURNING id_card_template INTO t_uni;
+    INSERT INTO template_mechanics (id_card_template, id_mechanic)
+      SELECT t_uni, id_mechanic FROM mechanics WHERE mechanic_name = 'COUNT_AS_UNICORN';
+
+    r := sp_create_game(u1, 'b1', 2, NULL);
+    v_game := (r->>'game_id')::bigint;
+    p1 := (r->>'player_id')::bigint;
+    PERFORM sp_add_cards_to_game(v_game, t_uni, 20);
+
+    FOR rec IN
+        SELECT c.id_card FROM cards c
+         WHERE c.id_game = v_game
+           AND NOT EXISTS (SELECT 1 FROM player_cards pc WHERE pc.id_card = c.id_card)
+         LIMIT 7
+    LOOP
+        INSERT INTO player_cards (id_player, id_card, is_public) VALUES (p1, rec.id_card, TRUE);
+    END LOOP;
+
+    ASSERT (_player_status(p1)->>'unicorns')::int = 7, 'не 7 единорогов до старта';
+    ASSERT fn_check_victory(v_game) = '{}'::jsonb, 'победа объявлена до старта';
+
+    RAISE NOTICE 'victory pre-start OK';
 END $$;
 
 ROLLBACK;

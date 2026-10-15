@@ -28,6 +28,12 @@ sequenceDiagram
     S->>D: Вызвать fn_list_mechanics
     D-->>S: Список механик
     S-->>C: 200 { id, name, type }
+
+    A->>C: Открывает справочник механик (публично)
+    C->>S: GET /api/mechanics
+    S->>D: Вызвать ту же fn_list_mechanics
+    D-->>S: Список механик
+    S-->>C: 200 { code, name, description }
     C->>S: PUT /api/admin/cards/{template_id}/mechanics<br/>список id механик
     S->>D: Вызвать sp_set_card_mechanics со списком id
     D-->>S: Итоговый набор

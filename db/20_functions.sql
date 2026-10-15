@@ -8,10 +8,11 @@
 --
 --  Кандидаты на вынос на сервер (пока в БД): _fire_leave_stable,
 --  _apply_active_mechanics, _apply_play, _available, sp_begin_turn,
---  sp_skip_turn, sp_apply_event, sp_end_turn, fn_check_victory.
+--  sp_apply_event, sp_end_turn, fn_check_victory.
 --
 --  Соглашения:
---   * move_status = TRUE  -> партия началась;
+--   * move_status = TRUE  -> партия началась; закончилась, если объявлен
+--     победитель (_finished -> fn_check_victory вернул непустой объект);
 --   * number_of_players    -> максимум мест (2..6);
 --   * имя партии синтетическое: 'Партия #<id>';
 --   * зоны карты:
@@ -23,8 +24,8 @@
 --     открытый ход = count(moves по игре)+1; текущий игрок = следующий по
 --     move_order после последнего хода (циклично);
 --   * ready / request_id / метка пропуска / длительности эффектов - вне схемы
---     (кэш сервера). Пропуск приходит аргументом skip_player в sp_begin_turn,
---     request_id не проверяется.
+--     (кэш сервера). Пропуск приходит аргументом skip_player в sp_begin_turn и
+--     фиксируется как пропущенный ход в moves; request_id не проверяется.
 --   * пароль: сервер считает хеш сам, БД хранит и сравнивает равенство.
 --
 --  Публичные функции совпадают с контрактом API.md. Актор в запись не
@@ -68,18 +69,39 @@ RETURNS boolean AS $$
 $$ LANGUAGE sql STABLE;
 
 
+-- [3] _template_mechanics
+-- Механики шаблона как jsonb-массив кодов (для снимков каталога и партии).
+CREATE OR REPLACE FUNCTION _template_mechanics(p_id_template bigint) RETURNS jsonb AS $$
+    SELECT COALESCE(jsonb_agg(m.mechanic_name::text ORDER BY m.mechanic_name), '[]'::jsonb)
+    FROM template_mechanics tm
+    JOIN mechanics m ON m.id_mechanic = tm.id_mechanic
+    WHERE tm.id_card_template = p_id_template;
+$$ LANGUAGE sql STABLE;
+
+
 -- --- зоны карт: единый универсальный примитив --------------------------------
 
--- [3] _move_card
+-- [4] _move_card
 -- Универсальное перемещение: карта уходит из любой зоны в указанную.
--- Триггеры не запускает - вызывающий код сам решает про leave_stable.
+-- Если карта покидает стойло (в другую зону или к другому игроку) - сама
+-- запускает leave-триггер, поэтому вызывающему коду об этом думать не нужно.
 CREATE OR REPLACE FUNCTION _move_card(p_id_player bigint, p_id_card bigint, p_zone text) RETURNS void AS $$
+DECLARE
+    v_owner bigint;
 BEGIN
     IF p_zone NOT IN ('hand', 'stable', 'deck', 'discard') THEN
         RAISE EXCEPTION 'неизвестная зона: %', p_zone USING ERRCODE = 'ED004';
     END IF;
     IF p_zone IN ('hand', 'stable') AND p_id_player IS NULL THEN
         RAISE EXCEPTION 'для зоны % нужен игрок', p_zone USING ERRCODE = 'ED004';
+    END IF;
+
+    SELECT pc.id_player INTO v_owner
+    FROM player_cards pc
+    WHERE pc.id_card = p_id_card AND pc.is_public = TRUE;
+
+    IF v_owner IS NOT NULL AND (p_zone <> 'stable' OR v_owner <> p_id_player) THEN
+        PERFORM _fire_leave_stable(p_id_card);
     END IF;
 
     DELETE FROM player_cards WHERE id_card = p_id_card;
@@ -98,7 +120,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
--- [4] _cards_in_zone
+-- [5] _cards_in_zone
 -- Универсальный список карт в зоне. Для hand/stable игрок обязателен,
 -- для stable без игрока - стойла всех игроков партии.
 CREATE OR REPLACE FUNCTION _cards_in_zone(p_id_game bigint, p_zone text, p_id_player bigint DEFAULT NULL)
@@ -126,13 +148,56 @@ RETURNS SETOF bigint AS $$
 $$ LANGUAGE sql STABLE;
 
 
--- [5] _game_started
+-- [6] _hand
+-- Рука игрока как jsonb-массив карт (card_id, template_id, имя).
+CREATE OR REPLACE FUNCTION _hand(p_id_player bigint) RETURNS jsonb AS $$
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+        'card_id',     c.id_card,
+        'template_id', c.id_card_template,
+        'name',        ct.card_name) ORDER BY pc.id_card), '[]'::jsonb)
+    FROM player_cards pc
+    JOIN cards c ON c.id_card = pc.id_card
+    JOIN card_templates ct ON ct.id_card_template = c.id_card_template
+    WHERE pc.id_player = p_id_player AND pc.is_public = FALSE;
+$$ LANGUAGE sql STABLE;
+
+
+-- --- состояние партии --------------------------------------------------------
+
+-- [7] _game_started
 CREATE OR REPLACE FUNCTION _game_started(p_id_game bigint) RETURNS boolean AS $$
     SELECT move_status FROM games WHERE id_game = p_id_game;
 $$ LANGUAGE sql STABLE;
 
 
--- [6] _lock_game
+-- [8] _finished
+-- Партия закончилась: объявлен победитель. До старта победителя нет (B1).
+-- plpgsql, а не sql: fn_check_victory определена ниже, и тело не должно
+-- проверяться при создании.
+CREATE OR REPLACE FUNCTION _finished(p_id_game bigint) RETURNS boolean AS $$
+BEGIN
+    RETURN fn_check_victory(p_id_game) <> '{}'::jsonb;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+
+-- [9] _game_summary
+-- Одна карточка партии для лобби и ответов на настройки.
+CREATE OR REPLACE FUNCTION _game_summary(p_id_game bigint) RETURNS jsonb AS $$
+    SELECT jsonb_build_object(
+        'id',             g.id_game,
+        'name',           'Партия #' || g.id_game,
+        'seats',          g.number_of_players,
+        'occupied',       (SELECT count(*) FROM players p WHERE p.id_game = g.id_game),
+        'needs_password', EXISTS (SELECT 1 FROM passwords pw WHERE pw.id_game = g.id_game),
+        'started',        g.move_status)
+    FROM games g WHERE g.id_game = p_id_game;
+$$ LANGUAGE sql STABLE;
+
+
+-- --- блокировки и общие проверки прав ----------------------------------------
+
+-- [10] _lock_game
 -- Блокирует партию под FOR UPDATE; при p_require_started дополнительно
 -- требует, что она уже началась.
 CREATE OR REPLACE FUNCTION _lock_game(p_id_game bigint, p_require_started boolean DEFAULT false) RETURNS void AS $$
@@ -148,20 +213,86 @@ END;
 $$ LANGUAGE plpgsql;
 
 
--- [7] _player_status
+-- [11] _lock_turn
+-- Блокирует партию и требует, что открыт именно этот номер хода.
+CREATE OR REPLACE FUNCTION _lock_turn(p_id_game bigint, p_turn int) RETURNS void AS $$
+BEGIN
+    PERFORM _lock_game(p_id_game, true);
+    IF p_turn IS DISTINCT FROM _turn_number(p_id_game) THEN
+        RAISE EXCEPTION 'номер хода не совпал' USING ERRCODE = 'ED003';
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- [12] _require_not_started
+CREATE OR REPLACE FUNCTION _require_not_started(p_id_game bigint) RETURNS void AS $$
+BEGIN
+    IF _game_started(p_id_game) THEN
+        RAISE EXCEPTION 'партия уже началась' USING ERRCODE = 'ED003';
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- [13] _require_host
+CREATE OR REPLACE FUNCTION _require_host(p_id_game bigint, p_id_user uuid) RETURNS void AS $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM players
+                   WHERE id_game = p_id_game AND is_admin = TRUE AND user_id = p_id_user) THEN
+        RAISE EXCEPTION 'только создатель' USING ERRCODE = 'ED002';
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- [14] _require_enemy_stable_target
+-- Цель эффекта - карта в чужом стойле той же партии.
+CREATE OR REPLACE FUNCTION _require_enemy_stable_target(p_id_game bigint, p_actor bigint, p_target bigint)
+RETURNS void AS $$
+BEGIN
+    IF p_target IS NULL THEN
+        RAISE EXCEPTION 'нужна цель' USING ERRCODE = 'ED004';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM player_cards pc
+        JOIN players pl ON pl.id_player = pc.id_player
+        WHERE pc.id_card = p_target AND pc.is_public = TRUE
+          AND pl.id_game = p_id_game AND pc.id_player <> p_actor
+    ) THEN
+        RAISE EXCEPTION 'неверная цель' USING ERRCODE = 'ED004';
+    END IF;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+
+-- --- игроки и ход ------------------------------------------------------------
+
+-- [15] _player_status
 -- Сводка стойла игрока одним запросом: единороги, защита, запрет розыгрыша.
 CREATE OR REPLACE FUNCTION _player_status(p_id_player bigint) RETURNS jsonb AS $$
-    SELECT jsonb_build_object(
-        'unicorns',   (count(*) FILTER (WHERE _has_mechanic(pc.id_card, 'COUNT_AS_UNICORN')))::int,
-        'protected',  COALESCE(bool_or(_has_mechanic(pc.id_card, 'PROTECT_STABLE')), FALSE),
-        'restricted', COALESCE(bool_or(_has_mechanic(pc.id_card, 'RESTRICT_CARD_PLAY')), FALSE)
+    WITH mc AS (
+        SELECT pc.id_card,
+               bool_or(m.mechanic_name = 'COUNT_AS_UNICORN')   AS uni,
+               bool_or(m.mechanic_name = 'PROTECT_STABLE')     AS prot,
+               bool_or(m.mechanic_name = 'RESTRICT_CARD_PLAY') AS restr
+        FROM player_cards pc
+        JOIN cards c ON c.id_card = pc.id_card
+        LEFT JOIN template_mechanics tm ON tm.id_card_template = c.id_card_template
+        LEFT JOIN mechanics m ON m.id_mechanic = tm.id_mechanic
+        WHERE pc.id_player = p_id_player AND pc.is_public = TRUE
+        GROUP BY pc.id_card
     )
-    FROM player_cards pc
-    WHERE pc.id_player = p_id_player AND pc.is_public = TRUE;
+    SELECT jsonb_build_object(
+        'unicorns',   (count(*) FILTER (WHERE uni))::int,
+        'protected',  COALESCE(bool_or(prot), FALSE),
+        'restricted', COALESCE(bool_or(restr), FALSE)
+    )
+    FROM mc;
 $$ LANGUAGE sql STABLE;
 
 
--- [8] _next_player
+-- [16] _next_player
 -- Следующий по move_order, по кругу. Без аргумента - первый в порядке хода.
 CREATE OR REPLACE FUNCTION _next_player(p_id_game bigint, p_id_player bigint) RETURNS bigint AS $$
     SELECT p.id_player
@@ -173,7 +304,7 @@ CREATE OR REPLACE FUNCTION _next_player(p_id_game bigint, p_id_player bigint) RE
 $$ LANGUAGE sql STABLE;
 
 
--- [9] _current_player
+-- [17] _current_player
 -- Чей сейчас ход: следующий по кругу после игрока, чей ход завершён последним.
 CREATE OR REPLACE FUNCTION _current_player(p_id_game bigint) RETURNS bigint AS $$
     SELECT _next_player(p_id_game, (
@@ -187,7 +318,7 @@ CREATE OR REPLACE FUNCTION _current_player(p_id_game bigint) RETURNS bigint AS $
 $$ LANGUAGE sql STABLE;
 
 
--- [10] _turn_number
+-- [18] _turn_number
 CREATE OR REPLACE FUNCTION _turn_number(p_id_game bigint) RETURNS int AS $$
     SELECT (count(*))::int + 1
     FROM moves m
@@ -196,7 +327,7 @@ CREATE OR REPLACE FUNCTION _turn_number(p_id_game bigint) RETURNS int AS $$
 $$ LANGUAGE sql STABLE;
 
 
--- [11] _record_move
+-- [19] _record_move
 -- Зафиксировать завершённый ход игрока.
 CREATE OR REPLACE FUNCTION _record_move(p_id_player bigint) RETURNS void AS $$
     INSERT INTO moves (id_player, move_number)
@@ -206,7 +337,8 @@ CREATE OR REPLACE FUNCTION _record_move(p_id_player bigint) RETURNS void AS $$
 $$ LANGUAGE sql;
 
 
--- [12] _fire_leave_stable
+-- [20] _fire_leave_stable
+-- Зовётся из _move_card, когда карта уходит из стойла.
 CREATE OR REPLACE FUNCTION _fire_leave_stable(p_id_card bigint) RETURNS void AS $$
 DECLARE
     v_player bigint;
@@ -238,7 +370,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
--- [13] _draw
+-- [21] _draw
 CREATE OR REPLACE FUNCTION _draw(p_id_game bigint, p_id_player bigint) RETURNS bigint AS $$
 DECLARE
     v_card bigint;
@@ -264,7 +396,7 @@ $$ LANGUAGE plpgsql;
 
 -- --- применение активных механик ---------------------------------------------
 
--- [14] _apply_active_mechanics
+-- [22] _apply_active_mechanics
 CREATE OR REPLACE FUNCTION _apply_active_mechanics(
     p_id_game bigint,
     p_actor   bigint,
@@ -275,6 +407,7 @@ CREATE OR REPLACE FUNCTION _apply_active_mechanics(
 DECLARE
     r        record;
     v_pick   bigint;
+    v_owner  bigint;
 BEGIN
     FOR r IN
         SELECT cm.mech AS mechanic_name
@@ -304,41 +437,20 @@ BEGIN
                         FROM _cards_in_zone(p_id_game, 'stable', p_actor) AS t(card_id)
                         ORDER BY random() LIMIT 1;
                         IF v_pick IS NOT NULL THEN
-                            PERFORM _fire_leave_stable(v_pick);
                             PERFORM _move_card(NULL, v_pick, 'discard');
                         END IF;
                     END IF;
 
                 WHEN 'DESTROY_IN_STABLE' THEN
-                    IF p_target IS NULL THEN
-                        RAISE EXCEPTION 'нужна цель' USING ERRCODE = 'ED004';
-                    END IF;
-                    IF NOT EXISTS (
-                        SELECT 1 FROM player_cards pc
-                        JOIN players pl ON pl.id_player = pc.id_player
-                        WHERE pc.id_card = p_target AND pc.is_public = TRUE
-                          AND pl.id_game = p_id_game AND pc.id_player <> p_actor
-                    ) THEN
-                        RAISE EXCEPTION 'неверная цель' USING ERRCODE = 'ED004';
-                    END IF;
-                    IF (_player_status((SELECT id_player FROM player_cards WHERE id_card = p_target))->>'protected')::boolean THEN
+                    PERFORM _require_enemy_stable_target(p_id_game, p_actor, p_target);
+                    SELECT pc.id_player INTO v_owner FROM player_cards pc WHERE pc.id_card = p_target;
+                    IF (_player_status(v_owner)->>'protected')::boolean THEN
                         RAISE EXCEPTION 'стойло цели защищено' USING ERRCODE = 'ED004';
                     END IF;
-                    PERFORM _fire_leave_stable(p_target);
                     PERFORM _move_card(NULL, p_target, 'discard');
 
                 WHEN 'STEAL_FROM_STABLE' THEN
-                    IF p_target IS NULL THEN
-                        RAISE EXCEPTION 'нужна цель' USING ERRCODE = 'ED004';
-                    END IF;
-                    IF NOT EXISTS (
-                        SELECT 1 FROM player_cards pc
-                        JOIN players pl ON pl.id_player = pc.id_player
-                        WHERE pc.id_card = p_target AND pc.is_public = TRUE
-                          AND pl.id_game = p_id_game AND pc.id_player <> p_actor
-                    ) THEN
-                        RAISE EXCEPTION 'неверная цель' USING ERRCODE = 'ED004';
-                    END IF;
+                    PERFORM _require_enemy_stable_target(p_id_game, p_actor, p_target);
                     PERFORM _move_card(p_actor, p_target, 'stable');
 
                 WHEN 'SEARCH_IN_DECK' THEN
@@ -361,7 +473,7 @@ BEGIN
                     NULL; -- колода всегда случайна
 
                 WHEN 'SKIP_PLAYER_TURN' THEN
-                    NULL; -- отметку ведёт сервер (вне схемы)
+                    NULL; -- метку ведёт сервер (вне схемы)
             END CASE;
         EXCEPTION WHEN OTHERS THEN
             IF p_lenient THEN
@@ -375,7 +487,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
--- [15] _apply_play
+-- [23] _apply_play
 CREATE OR REPLACE FUNCTION _apply_play(
     p_id_game bigint,
     p_actor   bigint,
@@ -383,12 +495,13 @@ CREATE OR REPLACE FUNCTION _apply_play(
     p_target  bigint
 ) RETURNS void AS $$
 DECLARE
+    v_mechs     mechanic_name_enum[] := ARRAY(SELECT m FROM _card_mechanics(p_id_card) AS t(m));
     v_zone      text;
     v_enter     boolean;
     v_turnstart boolean;
 BEGIN
-    v_enter     := _has_mechanic(p_id_card, 'TRIGGER_ON_ENTER_STABLE');
-    v_turnstart := _has_mechanic(p_id_card, 'TRIGGER_ON_TURN_START');
+    v_enter     := 'TRIGGER_ON_ENTER_STABLE' = ANY(v_mechs);
+    v_turnstart := 'TRIGGER_ON_TURN_START'   = ANY(v_mechs);
 
     -- разовые эффекты применяем сразу, если карта не отложена под триггер
     IF NOT v_enter AND NOT v_turnstart THEN
@@ -396,20 +509,20 @@ BEGIN
     END IF;
 
     -- итоговая зона карты: явные MOVE_TO_* важнее пассивных свойств
-    IF _has_mechanic(p_id_card, 'MOVE_TO_DISCARD') OR _has_mechanic(p_id_card, 'MOVE_TO_NURSERY') THEN
+    IF 'MOVE_TO_DISCARD' = ANY(v_mechs) OR 'MOVE_TO_NURSERY' = ANY(v_mechs) THEN
         v_zone := 'discard';
-    ELSIF _has_mechanic(p_id_card, 'MOVE_TO_STABLE') THEN
+    ELSIF 'MOVE_TO_STABLE' = ANY(v_mechs) THEN
         v_zone := 'stable';
-    ELSIF _has_mechanic(p_id_card, 'MOVE_TO_DECK') THEN
+    ELSIF 'MOVE_TO_DECK' = ANY(v_mechs) THEN
         v_zone := 'deck';
-    ELSIF _has_mechanic(p_id_card, 'MOVE_TO_HAND') THEN
+    ELSIF 'MOVE_TO_HAND' = ANY(v_mechs) THEN
         v_zone := 'hand';
-    ELSIF _has_mechanic(p_id_card, 'COUNT_AS_UNICORN')
-          OR _has_mechanic(p_id_card, 'PROTECT_STABLE')
-          OR _has_mechanic(p_id_card, 'RESTRICT_CARD_PLAY')
-          OR _has_mechanic(p_id_card, 'TRIGGER_ON_TURN_START')
-          OR _has_mechanic(p_id_card, 'TRIGGER_ON_ENTER_STABLE')
-          OR _has_mechanic(p_id_card, 'TRIGGER_ON_LEAVE_STABLE') THEN
+    ELSIF 'COUNT_AS_UNICORN' = ANY(v_mechs)
+       OR 'PROTECT_STABLE' = ANY(v_mechs)
+       OR 'RESTRICT_CARD_PLAY' = ANY(v_mechs)
+       OR 'TRIGGER_ON_TURN_START' = ANY(v_mechs)
+       OR 'TRIGGER_ON_ENTER_STABLE' = ANY(v_mechs)
+       OR 'TRIGGER_ON_LEAVE_STABLE' = ANY(v_mechs) THEN
         v_zone := 'stable';
     ELSE
         v_zone := 'discard';
@@ -423,7 +536,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
--- [16] _available
+-- [24] _available
 -- Список доступных к розыгрышу карт (приватный, отдаётся внутри снимка партии).
 CREATE OR REPLACE FUNCTION _available(p_id_game bigint, p_id_player bigint) RETURNS jsonb AS $$
 BEGIN
@@ -439,25 +552,32 @@ BEGIN
 
     RETURN COALESCE((
         SELECT jsonb_agg(jsonb_build_object(
-            'card_id',      c.id_card,
-            'template_id',  c.id_card_template,
-            'needs_target', nt.needs,
-            'targets', CASE WHEN nt.needs THEN COALESCE((
-                SELECT jsonb_agg(jsonb_build_object('id', pc2.id_card, 'label', ct2.card_name) ORDER BY pc2.id_card)
-                FROM player_cards pc2
-                JOIN players pl2 ON pl2.id_player = pc2.id_player
-                JOIN cards c2 ON c2.id_card = pc2.id_card
-                JOIN card_templates ct2 ON ct2.id_card_template = c2.id_card_template
-                WHERE pl2.id_game = p_id_game AND pc2.is_public = TRUE AND pc2.id_player <> p_id_player), '[]'::jsonb)
+            'card_id',      t.card_id,
+            'template_id',  t.template_id,
+            'needs_target', t.needs_target,
+            'targets', CASE WHEN t.needs_target THEN COALESCE((
+                SELECT jsonb_agg(jsonb_build_object('id', tt.card_id, 'label', 'Стойка ' || tt.move_order)
+                                 ORDER BY tt.card_id)
+                FROM (
+                    SELECT pc2.id_card AS card_id, pl2.move_order
+                    FROM player_cards pc2
+                    JOIN players pl2 ON pl2.id_player = pc2.id_player
+                    WHERE pl2.id_game = p_id_game AND pc2.is_public = TRUE
+                      AND pc2.id_player <> p_id_player
+                ) tt), '[]'::jsonb)
             END
-        ) ORDER BY c.id_card)
-        FROM player_cards pc
-        JOIN cards c ON c.id_card = pc.id_card
-        CROSS JOIN LATERAL (
-            SELECT (_has_mechanic(c.id_card, 'DESTROY_IN_STABLE')
-                    OR _has_mechanic(c.id_card, 'STEAL_FROM_STABLE')) AS needs
-        ) nt
-        WHERE pc.id_player = p_id_player AND pc.is_public = FALSE
+        ) ORDER BY t.card_id)
+        FROM (
+            SELECT pc.id_card AS card_id, c.id_card_template AS template_id,
+                   COALESCE(bool_or(m.mechanic_name IN ('DESTROY_IN_STABLE','STEAL_FROM_STABLE')), FALSE)
+                       AS needs_target
+            FROM player_cards pc
+            JOIN cards c ON c.id_card = pc.id_card
+            LEFT JOIN template_mechanics tm ON tm.id_card_template = c.id_card_template
+            LEFT JOIN mechanics m ON m.id_mechanic = tm.id_mechanic
+            WHERE pc.id_player = p_id_player AND pc.is_public = FALSE
+            GROUP BY pc.id_card, c.id_card_template
+        ) t
     ), '[]'::jsonb);
 END;
 $$ LANGUAGE plpgsql STABLE;
@@ -467,7 +587,7 @@ $$ LANGUAGE plpgsql STABLE;
 --  ЧТЕНИЕ
 -- =============================================================================
 
--- [17] fn_get_player
+-- [25] fn_get_player
 CREATE OR REPLACE FUNCTION fn_get_player(p_user_id uuid) RETURNS jsonb AS $$
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
         'id_player', p.id_player,
@@ -479,21 +599,14 @@ CREATE OR REPLACE FUNCTION fn_get_player(p_user_id uuid) RETURNS jsonb AS $$
 $$ LANGUAGE sql STABLE;
 
 
--- [18] fn_list_open_games
+-- [26] fn_list_open_games
 CREATE OR REPLACE FUNCTION fn_list_open_games(
     p_has_slot boolean DEFAULT TRUE,
     p_mine     boolean DEFAULT FALSE,
     p_id_user  uuid    DEFAULT NULL,
     p_search   text    DEFAULT NULL
 ) RETURNS jsonb AS $$
-    SELECT COALESCE(jsonb_agg(jsonb_build_object(
-        'id',             g.id_game,
-        'name',           'Партия #' || g.id_game,
-        'seats',          g.number_of_players,
-        'occupied',       (SELECT count(*) FROM players p WHERE p.id_game = g.id_game),
-        'needs_password', EXISTS (SELECT 1 FROM passwords pw WHERE pw.id_game = g.id_game),
-        'started',        g.move_status
-    ) ORDER BY g.id_game), '[]'::jsonb)
+    SELECT COALESCE(jsonb_agg(_game_summary(g.id_game) ORDER BY g.id_game), '[]'::jsonb)
     FROM games g
     WHERE (NOT p_has_slot
            OR (SELECT count(*) FROM players p WHERE p.id_game = g.id_game) < g.number_of_players)
@@ -505,24 +618,32 @@ CREATE OR REPLACE FUNCTION fn_list_open_games(
 $$ LANGUAGE sql STABLE;
 
 
--- [19] fn_get_game_state
+-- [27] fn_get_game_state
 CREATE OR REPLACE FUNCTION fn_get_game_state(p_id_game bigint, p_id_player bigint DEFAULT NULL)
 RETURNS jsonb AS $$
 DECLARE
-    v_game games%ROWTYPE;
-    v_json jsonb;
+    v_game    games%ROWTYPE;
+    v_turn    int;
+    v_current bigint;
+    v_json    jsonb;
 BEGIN
     SELECT * INTO v_game FROM games WHERE id_game = p_id_game;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'партия не найдена' USING ERRCODE = 'ED001';
     END IF;
 
+    IF v_game.move_status THEN
+        v_turn    := _turn_number(p_id_game);
+        v_current := _current_player(p_id_game);
+    END IF;
+
     v_json := jsonb_build_object(
         'game_id',        v_game.id_game,
         'name',           'Партия #' || v_game.id_game,
         'started',        v_game.move_status,
-        'turn',           CASE WHEN v_game.move_status THEN _turn_number(p_id_game) ELSE 0 END,
-        'current_player', CASE WHEN v_game.move_status THEN _current_player(p_id_game) ELSE NULL END,
+        'finished',       _finished(p_id_game),
+        'turn',           COALESCE(v_turn, 0),
+        'current_player', v_current,
         'deck_count',     (SELECT count(*) FROM _cards_in_zone(p_id_game, 'deck')),
         'winner',         fn_check_victory(p_id_game),
         'discard', COALESCE((
@@ -547,11 +668,7 @@ BEGIN
                         'card_id',   c.id_card,
                         'template_id', c.id_card_template,
                         'name',      ct.card_name,
-                        'mechanics', COALESCE((
-                            SELECT jsonb_agg(m.mechanic_name::text ORDER BY m.mechanic_name)
-                            FROM template_mechanics tm
-                            JOIN mechanics m ON m.id_mechanic = tm.id_mechanic
-                            WHERE tm.id_card_template = c.id_card_template), '[]'::jsonb)
+                        'mechanics', _template_mechanics(c.id_card_template)
                     ) ORDER BY pc.id_card)
                     FROM player_cards pc
                     JOIN cards c ON c.id_card = pc.id_card
@@ -563,15 +680,9 @@ BEGIN
 
     IF p_id_player IS NOT NULL THEN
         v_json := v_json || jsonb_build_object(
-            'your_turn', (v_game.move_status AND _current_player(p_id_game) = p_id_player),
+            'your_turn', (v_game.move_status AND v_current = p_id_player),
             'available', _available(p_id_game, p_id_player),
-            'your_hand', COALESCE((
-                SELECT jsonb_agg(jsonb_build_object(
-                    'card_id', c.id_card, 'template_id', c.id_card_template, 'name', ct.card_name) ORDER BY pc.id_card)
-                FROM player_cards pc
-                JOIN cards c ON c.id_card = pc.id_card
-                JOIN card_templates ct ON ct.id_card_template = c.id_card_template
-                WHERE pc.id_player = p_id_player AND pc.is_public = FALSE), '[]'::jsonb)
+            'your_hand', _hand(p_id_player)
         );
     END IF;
 
@@ -580,14 +691,20 @@ END;
 $$ LANGUAGE plpgsql STABLE;
 
 
--- [20] fn_check_victory
+-- [28] fn_check_victory
 CREATE OR REPLACE FUNCTION fn_check_victory(p_id_game bigint) RETURNS jsonb AS $$
 DECLARE
     v_players   int;
     v_threshold int;
     v_winner    bigint;
+    v_count     int;
     v_deck      int;
 BEGIN
+    -- до старта победителя нет (B1)
+    IF NOT COALESCE(_game_started(p_id_game), FALSE) THEN
+        RETURN '{}'::jsonb;
+    END IF;
+
     SELECT count(*) INTO v_players FROM players WHERE id_game = p_id_game;
     IF v_players = 0 THEN
         RETURN '{}'::jsonb;
@@ -595,7 +712,7 @@ BEGIN
 
     v_threshold := CASE WHEN v_players <= 5 THEN 7 ELSE 6 END;
 
-    SELECT id_player INTO v_winner FROM (
+    SELECT id_player, n INTO v_winner, v_count FROM (
         SELECT p.id_player, (_player_status(p.id_player)->>'unicorns')::int AS n
         FROM players p WHERE p.id_game = p_id_game
     ) t
@@ -604,12 +721,12 @@ BEGIN
     LIMIT 1;
 
     IF v_winner IS NOT NULL THEN
-        RETURN jsonb_build_object('winner', v_winner, 'reason', 'unicorns', 'count', (_player_status(v_winner)->>'unicorns')::int);
+        RETURN jsonb_build_object('winner', v_winner, 'reason', 'unicorns', 'count', v_count);
     END IF;
 
     v_deck := (SELECT count(*) FROM _cards_in_zone(p_id_game, 'deck'));
     IF v_deck = 0 THEN
-        SELECT id_player INTO v_winner FROM (
+        SELECT id_player, n INTO v_winner, v_count FROM (
             SELECT p.id_player,
                    (_player_status(p.id_player)->>'unicorns')::int AS n,
                    COALESCE((
@@ -622,7 +739,7 @@ BEGIN
         ) t
         ORDER BY n DESC, letters DESC
         LIMIT 1;
-        RETURN jsonb_build_object('winner', v_winner, 'reason', 'deck_empty', 'count', (_player_status(v_winner)->>'unicorns')::int);
+        RETURN jsonb_build_object('winner', v_winner, 'reason', 'deck_empty', 'count', v_count);
     END IF;
 
     RETURN '{}'::jsonb;
@@ -634,7 +751,7 @@ $$ LANGUAGE plpgsql STABLE;
 --  СПРАВОЧНИКИ / АДМИНКА
 -- =============================================================================
 
--- [21] fn_list_mechanics
+-- [29] fn_list_mechanics
 CREATE OR REPLACE FUNCTION fn_list_mechanics() RETURNS jsonb AS $$
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
         'id',          id_mechanic,
@@ -668,18 +785,14 @@ CREATE OR REPLACE FUNCTION fn_list_mechanics() RETURNS jsonb AS $$
 $$ LANGUAGE sql STABLE;
 
 
--- [22] fn_list_card_templates
+-- [30] fn_list_card_templates
 CREATE OR REPLACE FUNCTION fn_list_card_templates(p_search text DEFAULT NULL) RETURNS jsonb AS $$
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
         'id',          ct.id_card_template,
         'name',        ct.card_name,
         'description', ct.card_description,
         'img_link',    ct.img_link,
-        'mechanics',   COALESCE((
-            SELECT jsonb_agg(m.mechanic_name::text ORDER BY m.mechanic_name)
-            FROM template_mechanics tm
-            JOIN mechanics m ON m.id_mechanic = tm.id_mechanic
-            WHERE tm.id_card_template = ct.id_card_template), '[]'::jsonb)
+        'mechanics',   _template_mechanics(ct.id_card_template)
     ) ORDER BY ct.id_card_template), '[]'::jsonb)
     FROM card_templates ct
     WHERE p_search IS NULL OR p_search = ''
@@ -693,7 +806,7 @@ CREATE OR REPLACE FUNCTION fn_list_card_templates(p_search text DEFAULT NULL) RE
 $$ LANGUAGE sql STABLE;
 
 
--- [23] fn_get_card_template
+-- [31] fn_get_card_template
 CREATE OR REPLACE FUNCTION fn_get_card_template(p_id bigint) RETURNS jsonb AS $$
 DECLARE
     v_json jsonb;
@@ -703,11 +816,7 @@ BEGIN
         'name',        ct.card_name,
         'description', ct.card_description,
         'img_link',    ct.img_link,
-        'mechanics',   COALESCE((
-            SELECT jsonb_agg(m.mechanic_name::text ORDER BY m.mechanic_name)
-            FROM template_mechanics tm
-            JOIN mechanics m ON m.id_mechanic = tm.id_mechanic
-            WHERE tm.id_card_template = ct.id_card_template), '[]'::jsonb)
+        'mechanics',   _template_mechanics(ct.id_card_template)
     ) INTO v_json
     FROM card_templates ct WHERE ct.id_card_template = p_id;
 
@@ -719,7 +828,7 @@ END;
 $$ LANGUAGE plpgsql STABLE;
 
 
--- [24] sp_upsert_card_template
+-- [32] sp_upsert_card_template
 -- Создаёт шаблон, если p_id не задан, иначе правит существующий.
 CREATE OR REPLACE FUNCTION sp_upsert_card_template(
     p_id bigint DEFAULT NULL,
@@ -751,7 +860,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
--- [25] sp_set_card_mechanics
+-- [33] sp_set_card_mechanics
 CREATE OR REPLACE FUNCTION sp_set_card_mechanics(p_id_template bigint, p_ids bigint[])
 RETURNS jsonb AS $$
 BEGIN
@@ -767,23 +876,17 @@ BEGIN
     INSERT INTO template_mechanics (id_mechanic, id_card_template)
     SELECT i, p_id_template FROM unnest(COALESCE(p_ids, ARRAY[]::bigint[])) AS i;
 
-    RETURN (SELECT jsonb_build_object('mechanics', COALESCE((
-        SELECT jsonb_agg(m.mechanic_name::text ORDER BY m.mechanic_name)
-        FROM template_mechanics tm
-        JOIN mechanics m ON m.id_mechanic = tm.id_mechanic
-        WHERE tm.id_card_template = p_id_template), '[]'::jsonb)));
+    RETURN jsonb_build_object('mechanics', _template_mechanics(p_id_template));
 END;
 $$ LANGUAGE plpgsql;
 
 
--- [26] sp_add_cards_to_game
+-- [34] sp_add_cards_to_game
 CREATE OR REPLACE FUNCTION sp_add_cards_to_game(p_id_game bigint, p_id_template bigint, p_count int)
 RETURNS jsonb AS $$
 BEGIN
     PERFORM _lock_game(p_id_game);
-    IF _game_started(p_id_game) THEN
-        RAISE EXCEPTION 'партия уже началась' USING ERRCODE = 'ED003';
-    END IF;
+    PERFORM _require_not_started(p_id_game);
     IF NOT EXISTS (SELECT 1 FROM card_templates WHERE id_card_template = p_id_template) THEN
         RAISE EXCEPTION 'неизвестный шаблон' USING ERRCODE = 'ED004';
     END IF;
@@ -803,7 +906,7 @@ $$ LANGUAGE plpgsql;
 --  ЛОББИ
 -- =============================================================================
 
--- [27] sp_create_game
+-- [35] sp_create_game
 CREATE OR REPLACE FUNCTION sp_create_game(
     p_user_id uuid, p_name text, p_max_players int, p_password_hash text DEFAULT NULL
 ) RETURNS jsonb AS $$
@@ -832,7 +935,9 @@ END;
 $$ LANGUAGE plpgsql;
 
 
--- [28] sp_join_game
+-- [36] sp_join_game
+-- Возврат на своё место отдаёт реальную руку (B2): после старта карты на месте,
+-- до старта рука пуста.
 CREATE OR REPLACE FUNCTION sp_join_game(
     p_user_id uuid, p_id_game bigint, p_password_hash text DEFAULT NULL
 ) RETURNS jsonb AS $$
@@ -846,13 +951,11 @@ BEGIN
     SELECT id_player, is_admin INTO v_player, v_host
     FROM players WHERE id_game = p_id_game AND user_id = p_user_id;
     IF v_player IS NOT NULL THEN
-        -- возврат на своё место (в т.ч. после старта): рука пустая
-        RETURN jsonb_build_object('player_id', v_player, 'is_host', v_host, 'hand', '[]'::jsonb, 'returning', TRUE);
+        RETURN jsonb_build_object('player_id', v_player, 'is_host', v_host,
+                                  'hand', _hand(v_player), 'returning', TRUE);
     END IF;
 
-    IF _game_started(p_id_game) THEN
-        RAISE EXCEPTION 'партия уже началась' USING ERRCODE = 'ED003';
-    END IF;
+    PERFORM _require_not_started(p_id_game);
 
     IF EXISTS (SELECT 1 FROM passwords WHERE id_game = p_id_game) THEN
         IF p_password_hash IS NULL
@@ -871,12 +974,12 @@ BEGIN
     VALUES (p_id_game, v_order, p_user_id, FALSE)
     RETURNING id_player INTO v_player;
 
-    RETURN jsonb_build_object('player_id', v_player, 'is_host', FALSE, 'hand', '[]'::jsonb);
+    RETURN jsonb_build_object('player_id', v_player, 'is_host', FALSE, 'hand', _hand(v_player));
 END;
 $$ LANGUAGE plpgsql;
 
 
--- [29] sp_leave_game
+-- [37] sp_leave_game
 CREATE OR REPLACE FUNCTION sp_leave_game(p_id_player bigint, p_id_game bigint) RETURNS void AS $$
 DECLARE
     r record;
@@ -885,6 +988,9 @@ BEGIN
 
     IF NOT EXISTS (SELECT 1 FROM players WHERE id_player = p_id_player AND id_game = p_id_game) THEN
         RAISE EXCEPTION 'игрок не в этой партии' USING ERRCODE = 'ED002';
+    END IF;
+    IF _finished(p_id_game) THEN
+        RAISE EXCEPTION 'партия уже закончилась' USING ERRCODE = 'ED003';
     END IF;
 
     IF NOT _game_started(p_id_game) THEN
@@ -900,22 +1006,20 @@ END;
 $$ LANGUAGE plpgsql;
 
 
--- [30] sp_update_game
+-- [38] sp_update_game
+-- Пароль трогаем только при p_password_set: иначе PATCH settings его не касается
+-- (B3). p_password_hash = NULL при p_password_set = TRUE означает «снять пароль».
 CREATE OR REPLACE FUNCTION sp_update_game(
     p_id_game bigint, p_id_user uuid,
-    p_name text DEFAULT NULL, p_max_players int DEFAULT NULL, p_password_hash text DEFAULT NULL
+    p_name text DEFAULT NULL, p_max_players int DEFAULT NULL,
+    p_password_hash text DEFAULT NULL, p_password_set boolean DEFAULT FALSE
 ) RETURNS jsonb AS $$
 DECLARE
     v_occupied int;
 BEGIN
     PERFORM _lock_game(p_id_game);
-
-    IF NOT EXISTS (SELECT 1 FROM players WHERE id_game = p_id_game AND is_admin = TRUE AND user_id = p_id_user) THEN
-        RAISE EXCEPTION 'только создатель' USING ERRCODE = 'ED002';
-    END IF;
-    IF _game_started(p_id_game) THEN
-        RAISE EXCEPTION 'партия уже началась' USING ERRCODE = 'ED003';
-    END IF;
+    PERFORM _require_host(p_id_game, p_id_user);
+    PERFORM _require_not_started(p_id_game);
 
     IF p_max_players IS NOT NULL THEN
         v_occupied := (SELECT count(*) FROM players WHERE id_game = p_id_game);
@@ -929,37 +1033,46 @@ BEGIN
     END IF;
 
     -- имя синтетическое, p_name игнорируется
+    IF p_password_set THEN
+        IF p_password_hash IS NULL THEN
+            DELETE FROM passwords WHERE id_game = p_id_game;
+        ELSE
+            INSERT INTO passwords (id_game, password_hash) VALUES (p_id_game, p_password_hash)
+            ON CONFLICT (id_game) DO UPDATE SET password_hash = EXCLUDED.password_hash;
+        END IF;
+    END IF;
+
+    RETURN jsonb_build_object('game', _game_summary(p_id_game));
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- [39] sp_set_game_password
+-- Отдельный путь для POST /api/games/{game_id}/password: пароль ставит/снимает
+-- хост (роль admin) до старта. NULL снимает пароль.
+CREATE OR REPLACE FUNCTION sp_set_game_password(p_id_game bigint, p_id_user uuid, p_password_hash text)
+RETURNS void AS $$
+BEGIN
+    PERFORM _lock_game(p_id_game);
+    PERFORM _require_host(p_id_game, p_id_user);
+    PERFORM _require_not_started(p_id_game);
+
     IF p_password_hash IS NULL THEN
         DELETE FROM passwords WHERE id_game = p_id_game;
     ELSE
         INSERT INTO passwords (id_game, password_hash) VALUES (p_id_game, p_password_hash)
         ON CONFLICT (id_game) DO UPDATE SET password_hash = EXCLUDED.password_hash;
     END IF;
-
-    RETURN jsonb_build_object('game', (
-        SELECT jsonb_build_object(
-            'id',             g.id_game,
-            'name',           'Партия #' || g.id_game,
-            'seats',          g.number_of_players,
-            'occupied',       (SELECT count(*) FROM players p WHERE p.id_game = g.id_game),
-            'needs_password', EXISTS (SELECT 1 FROM passwords pw WHERE pw.id_game = g.id_game),
-            'started',        g.move_status)
-        FROM games g WHERE g.id_game = p_id_game));
 END;
 $$ LANGUAGE plpgsql;
 
 
--- [31] sp_cancel_game
+-- [40] sp_cancel_game
 CREATE OR REPLACE FUNCTION sp_cancel_game(p_id_game bigint, p_id_user uuid) RETURNS void AS $$
 BEGIN
     PERFORM _lock_game(p_id_game);
-
-    IF NOT EXISTS (SELECT 1 FROM players WHERE id_game = p_id_game AND is_admin = TRUE AND user_id = p_id_user) THEN
-        RAISE EXCEPTION 'только создатель' USING ERRCODE = 'ED002';
-    END IF;
-    IF _game_started(p_id_game) THEN
-        RAISE EXCEPTION 'партия уже началась' USING ERRCODE = 'ED003';
-    END IF;
+    PERFORM _require_host(p_id_game, p_id_user);
+    PERFORM _require_not_started(p_id_game);
 
     DELETE FROM games WHERE id_game = p_id_game;
 END;
@@ -970,7 +1083,7 @@ $$ LANGUAGE plpgsql;
 --  ИГРА
 -- =============================================================================
 
--- [32] sp_start_game
+-- [41] sp_start_game
 CREATE OR REPLACE FUNCTION sp_start_game(p_id_game bigint) RETURNS jsonb AS $$
 DECLARE
     v_players int;
@@ -980,10 +1093,7 @@ DECLARE
     v_first   jsonb;
 BEGIN
     PERFORM _lock_game(p_id_game);
-
-    IF _game_started(p_id_game) THEN
-        RAISE EXCEPTION 'партия уже началась' USING ERRCODE = 'ED003';
-    END IF;
+    PERFORM _require_not_started(p_id_game);
 
     v_players := (SELECT count(*) FROM players WHERE id_game = p_id_game);
     IF v_players < 2 THEN
@@ -1009,7 +1119,9 @@ END;
 $$ LANGUAGE plpgsql;
 
 
--- [33] sp_begin_turn
+-- [42] sp_begin_turn
+-- Пропущенный ход фиксируется в moves, чтобы счётчик и текущий игрок реально
+-- сдвинулись (B4/B5): единственный путь пропуска - аргумент skip_player.
 CREATE OR REPLACE FUNCTION sp_begin_turn(p_id_game bigint, p_skip_player bigint DEFAULT NULL) RETURNS jsonb AS $$
 DECLARE
     v_candidate bigint;
@@ -1020,12 +1132,16 @@ DECLARE
     r           record;
 BEGIN
     PERFORM _lock_game(p_id_game, true);
+    IF _finished(p_id_game) THEN
+        RAISE EXCEPTION 'партия уже закончилась' USING ERRCODE = 'ED003';
+    END IF;
 
     v_players   := (SELECT count(*) FROM players WHERE id_game = p_id_game);
     v_candidate := _current_player(p_id_game);
 
     WHILE p_skip_player IS NOT NULL AND v_candidate = p_skip_player LOOP
-        v_candidate := _next_player(p_id_game, v_candidate);
+        PERFORM _record_move(v_candidate);
+        v_candidate := _current_player(p_id_game);
         v_skips := v_skips + 1;
         IF v_skips >= v_players THEN
             RAISE EXCEPTION 'все ходы пропущены' USING ERRCODE = 'ED003';
@@ -1054,24 +1170,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
--- [34] sp_skip_turn
-CREATE OR REPLACE FUNCTION sp_skip_turn(p_id_game bigint) RETURNS jsonb AS $$
-DECLARE
-    v_player bigint;
-    v_next   jsonb;
-BEGIN
-    PERFORM _lock_game(p_id_game, true);
-
-    v_player := _current_player(p_id_game);
-    PERFORM _record_move(v_player);
-
-    v_next := sp_begin_turn(p_id_game);
-    RETURN jsonb_build_object('skipped', v_player, 'next', v_next);
-END;
-$$ LANGUAGE plpgsql;
-
-
--- [35] sp_apply_event
+-- [43] sp_apply_event
 -- Актор не передаётся: это всегда текущий игрок. Проверка «не его ход» живёт на
 -- сервере; база проверяет номер хода и что карта лежит в руке текущего игрока.
 CREATE OR REPLACE FUNCTION sp_apply_event(
@@ -1081,9 +1180,9 @@ CREATE OR REPLACE FUNCTION sp_apply_event(
 DECLARE
     v_actor bigint;
 BEGIN
-    PERFORM _lock_game(p_id_game, true);
-    IF p_turn IS DISTINCT FROM _turn_number(p_id_game) THEN
-        RAISE EXCEPTION 'номер хода не совпал' USING ERRCODE = 'ED003';
+    PERFORM _lock_turn(p_id_game, p_turn);
+    IF _finished(p_id_game) THEN
+        RAISE EXCEPTION 'партия уже закончилась' USING ERRCODE = 'ED003';
     END IF;
     IF p_do NOT IN ('play', 'discard') THEN
         RAISE EXCEPTION 'неизвестное действие' USING ERRCODE = 'ED004';
@@ -1109,15 +1208,16 @@ END;
 $$ LANGUAGE plpgsql;
 
 
--- [36] sp_end_turn
+-- [44] sp_end_turn
+-- Закрывает ход; следующий открывает только если партия не закончилась (B6).
 CREATE OR REPLACE FUNCTION sp_end_turn(p_id_game bigint, p_turn int) RETURNS void AS $$
 DECLARE
     v_actor  bigint;
     v_excess bigint;
 BEGIN
-    PERFORM _lock_game(p_id_game, true);
-    IF p_turn IS DISTINCT FROM _turn_number(p_id_game) THEN
-        RAISE EXCEPTION 'номер хода не совпал' USING ERRCODE = 'ED003';
+    PERFORM _lock_turn(p_id_game, p_turn);
+    IF _finished(p_id_game) THEN
+        RAISE EXCEPTION 'партия уже закончилась' USING ERRCODE = 'ED003';
     END IF;
 
     v_actor := _current_player(p_id_game);
@@ -1132,6 +1232,8 @@ BEGIN
 
     PERFORM _record_move(v_actor);
 
-    PERFORM sp_begin_turn(p_id_game);
+    IF NOT _finished(p_id_game) THEN
+        PERFORM sp_begin_turn(p_id_game);
+    END IF;
 END;
 $$ LANGUAGE plpgsql;

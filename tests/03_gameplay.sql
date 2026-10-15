@@ -56,6 +56,11 @@ BEGIN
     ASSERT (SELECT count(*) FROM _cards_in_zone(v_game, 'hand', p1)) = 6, 'p1 должен добрать до 6';
     ASSERT (SELECT count(*) FROM _cards_in_zone(v_game, 'hand', p2)) = 5, 'p2 должен иметь 5';
 
+    -- возврат на место после старта отдаёт реальную руку (B2)
+    r := sp_join_game(u2, v_game, NULL);
+    ASSERT (r->>'returning')::boolean, 'возврат после старта не сработал';
+    ASSERT jsonb_array_length(r->'hand') = 5, 'рука после старта не пришла';
+
     -- добавить карты после старта -> ED003
     BEGIN PERFORM sp_add_cards_to_game(v_game, t_uni, 1); RAISE EXCEPTION 'ожидалось ED003';
     EXCEPTION WHEN SQLSTATE 'ED003' THEN NULL; END;
@@ -146,6 +151,13 @@ BEGIN
     SELECT h AS id_card INTO c_discard FROM _cards_in_zone(v_game, 'hand', p1) AS h LIMIT 1;
     BEGIN PERFORM sp_apply_event(v_game, 3, 'r1', 'play', c_discard, NULL); RAISE EXCEPTION 'ожидалось ED004';
     EXCEPTION WHEN SQLSTATE 'ED004' THEN NULL; END;
+
+    -- пропуск хода реально сдвигает очередь и пишется в лог (B4/B5)
+    ASSERT _current_player(v_game) = p1, 'перед пропуском ход должен быть у p1';
+    r := sp_begin_turn(v_game, p1);
+    ASSERT _current_player(v_game) = p2, 'skip_player не сдвинул ход';
+    ASSERT _turn_number(v_game) = 4, 'пропуск не записан в лог ходов';
+    ASSERT (r->>'skipped')::boolean, 'пропуск не отмечен в ответе';
 
     RAISE NOTICE 'gameplay OK';
 END $$;

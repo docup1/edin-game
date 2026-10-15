@@ -17,11 +17,11 @@ BEGIN
         ('sp_create_game(uuid,text,integer,text)'),
         ('sp_join_game(uuid,bigint,text)'),
         ('sp_leave_game(bigint,bigint)'),
-        ('sp_update_game(bigint,uuid,text,integer,text)'),
+        ('sp_update_game(bigint,uuid,text,integer,text,boolean)'),
+        ('sp_set_game_password(bigint,uuid,text)'),
         ('sp_cancel_game(bigint,uuid)'),
         ('sp_start_game(bigint)'),
         ('sp_begin_turn(bigint,bigint)'),
-        ('sp_skip_turn(bigint)'),
         ('sp_apply_event(bigint,integer,text,text,bigint,bigint)'),
         ('sp_end_turn(bigint,integer)')
     ) AS t(sig)

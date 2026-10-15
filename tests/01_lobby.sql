@@ -126,17 +126,32 @@ BEGIN
     EXCEPTION WHEN SQLSTATE 'ED002' THEN NULL;
     END;
 
-    -- верный пароль -> ок
+    -- верный пароль -> ок; до старта рука пуста (B2)
     v := sp_join_game(v_guest, v_game, 'hash-1');
     ASSERT v->>'player_id' IS NOT NULL, 'не пустило с верным паролем';
+    ASSERT jsonb_array_length(v->'hand') = 0, 'рука до старта не пуста';
 
-    -- снять пароль
-    PERFORM sp_update_game(v_game, v_host, NULL, NULL, NULL);
+    -- возврат на своё место отдаёт руку (B2)
+    v := sp_join_game(v_guest, v_game, 'hash-1');
+    ASSERT (v->>'returning')::boolean, 'возврат не сработал';
+    ASSERT v->'hand' IS NOT NULL, 'возврат не отдал руку';
+
+    -- снять пароль (p_password_set = TRUE)
+    PERFORM sp_update_game(v_game, v_host, NULL, NULL, NULL, TRUE);
     ASSERT NOT EXISTS (SELECT 1 FROM passwords WHERE id_game = v_game), 'пароль не снят';
 
     -- поставить пароль отдельной функцией
-    PERFORM sp_update_game(v_game, v_host, NULL, NULL, 'hash-2');
+    PERFORM sp_set_game_password(v_game, v_host, 'hash-2');
     ASSERT EXISTS (SELECT 1 FROM passwords WHERE id_game = v_game), 'пароль не поставлен';
+
+    -- PATCH настроек без p_password_set не трогает пароль (B3)
+    PERFORM sp_update_game(v_game, v_host, NULL, 2, NULL);
+    ASSERT (SELECT password_hash FROM passwords WHERE id_game = v_game) = 'hash-2',
+        'PATCH без password_set сбросил/сломал пароль';
+
+    -- снять пароль через отдельную функцию
+    PERFORM sp_set_game_password(v_game, v_host, NULL);
+    ASSERT NOT EXISTS (SELECT 1 FROM passwords WHERE id_game = v_game), 'пароль не снят отдельной функцией';
 
     -- отмена хостом
     PERFORM sp_cancel_game(v_game, v_host);
