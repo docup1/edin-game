@@ -36,6 +36,7 @@
 --  ВНУТРЕННИЕ ХЕЛПЕРЫ
 -- =============================================================================
 
+-- [1] _mechanic_description
 CREATE OR REPLACE FUNCTION _mechanic_description(p_name mechanic_name_enum)
 RETURNS text AS $$
     SELECT CASE p_name
@@ -63,6 +64,7 @@ RETURNS text AS $$
 $$ LANGUAGE sql IMMUTABLE;
 
 
+-- [2] _card_mechanics
 CREATE OR REPLACE FUNCTION _card_mechanics(p_id_card bigint) RETURNS SETOF mechanic_name_enum AS $$
     SELECT m.mechanic_name
     FROM cards c
@@ -72,6 +74,7 @@ CREATE OR REPLACE FUNCTION _card_mechanics(p_id_card bigint) RETURNS SETOF mecha
 $$ LANGUAGE sql STABLE;
 
 
+-- [3] _has_mechanic
 CREATE OR REPLACE FUNCTION _has_mechanic(p_id_card bigint, p_name mechanic_name_enum)
 RETURNS boolean AS $$
     SELECT EXISTS (
@@ -86,6 +89,7 @@ $$ LANGUAGE sql STABLE;
 
 -- --- зоны карт: единый универсальный примитив --------------------------------
 
+-- [4] _move_card
 -- Универсальное перемещение: карта уходит из любой зоны в указанную.
 -- Триггеры не запускает - вызывающий код сам решает про leave_stable.
 CREATE OR REPLACE FUNCTION _move_card(p_id_player bigint, p_id_card bigint, p_zone text) RETURNS void AS $$
@@ -113,6 +117,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- [5] _cards_in_zone
 -- Универсальный список карт в зоне. Для hand/stable игрок обязателен,
 -- для stable без игрока - стойла всех игроков партии.
 CREATE OR REPLACE FUNCTION _cards_in_zone(p_id_game bigint, p_zone text, p_id_player bigint DEFAULT NULL)
@@ -140,6 +145,7 @@ RETURNS SETOF bigint AS $$
 $$ LANGUAGE sql STABLE;
 
 
+-- [6] _game_lock
 CREATE OR REPLACE FUNCTION _game_lock(p_id_game bigint) RETURNS void AS $$
 BEGIN
     PERFORM 1 FROM games WHERE id_game = p_id_game FOR UPDATE;
@@ -150,11 +156,13 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- [7] _game_started
 CREATE OR REPLACE FUNCTION _game_started(p_id_game bigint) RETURNS boolean AS $$
     SELECT move_status FROM games WHERE id_game = p_id_game;
 $$ LANGUAGE sql STABLE;
 
 
+-- [8] _lock_started
 -- Блокировка партии + требование «партия началась».
 CREATE OR REPLACE FUNCTION _lock_started(p_id_game bigint) RETURNS void AS $$
 BEGIN
@@ -166,6 +174,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- [9] _player_unicorns
 CREATE OR REPLACE FUNCTION _player_unicorns(p_id_player bigint) RETURNS int AS $$
     SELECT count(*)::int
     FROM player_cards pc
@@ -174,6 +183,7 @@ CREATE OR REPLACE FUNCTION _player_unicorns(p_id_player bigint) RETURNS int AS $
 $$ LANGUAGE sql STABLE;
 
 
+-- [10] _is_protected
 CREATE OR REPLACE FUNCTION _is_protected(p_id_player bigint) RETURNS boolean AS $$
     SELECT EXISTS (
         SELECT 1 FROM player_cards pc
@@ -182,6 +192,7 @@ CREATE OR REPLACE FUNCTION _is_protected(p_id_player bigint) RETURNS boolean AS 
 $$ LANGUAGE sql STABLE;
 
 
+-- [11] _is_restricted
 CREATE OR REPLACE FUNCTION _is_restricted(p_id_player bigint) RETURNS boolean AS $$
     SELECT EXISTS (
         SELECT 1 FROM player_cards pc
@@ -190,6 +201,7 @@ CREATE OR REPLACE FUNCTION _is_restricted(p_id_player bigint) RETURNS boolean AS
 $$ LANGUAGE sql STABLE;
 
 
+-- [12] _last_mover
 CREATE OR REPLACE FUNCTION _last_mover(p_id_game bigint) RETURNS bigint AS $$
     SELECT m.id_player
     FROM moves m
@@ -200,6 +212,7 @@ CREATE OR REPLACE FUNCTION _last_mover(p_id_game bigint) RETURNS bigint AS $$
 $$ LANGUAGE sql STABLE;
 
 
+-- [13] _next_player
 -- Следующий по move_order, по кругу. Без аргумента - первый в порядке хода.
 CREATE OR REPLACE FUNCTION _next_player(p_id_game bigint, p_id_player bigint) RETURNS bigint AS $$
     SELECT p.id_player
@@ -211,11 +224,13 @@ CREATE OR REPLACE FUNCTION _next_player(p_id_game bigint, p_id_player bigint) RE
 $$ LANGUAGE sql STABLE;
 
 
+-- [14] _current_player
 CREATE OR REPLACE FUNCTION _current_player(p_id_game bigint) RETURNS bigint AS $$
     SELECT _next_player(p_id_game, _last_mover(p_id_game));
 $$ LANGUAGE sql STABLE;
 
 
+-- [15] _turn_number
 CREATE OR REPLACE FUNCTION _turn_number(p_id_game bigint) RETURNS int AS $$
     SELECT (count(*))::int + 1
     FROM moves m
@@ -224,6 +239,7 @@ CREATE OR REPLACE FUNCTION _turn_number(p_id_game bigint) RETURNS int AS $$
 $$ LANGUAGE sql STABLE;
 
 
+-- [16] _record_move
 -- Зафиксировать завершённый ход игрока.
 CREATE OR REPLACE FUNCTION _record_move(p_id_player bigint) RETURNS void AS $$
     INSERT INTO moves (id_player, move_number)
@@ -233,6 +249,7 @@ CREATE OR REPLACE FUNCTION _record_move(p_id_player bigint) RETURNS void AS $$
 $$ LANGUAGE sql;
 
 
+-- [17] _notify
 CREATE OR REPLACE FUNCTION _notify(p_id_game bigint, p_event text) RETURNS void AS $$
 BEGIN
     PERFORM pg_notify('edin_game', jsonb_build_object('game_id', p_id_game, 'event', p_event)::text);
@@ -240,11 +257,13 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- [18] _trigger_depth
 CREATE OR REPLACE FUNCTION _trigger_depth() RETURNS int AS $$
     SELECT COALESCE(NULLIF(current_setting('edin.trigger_depth', true), '')::int, 0);
 $$ LANGUAGE sql STABLE;
 
 
+-- [19] _fire_leave_stable
 CREATE OR REPLACE FUNCTION _fire_leave_stable(p_id_card bigint) RETURNS void AS $$
 DECLARE
     v_player bigint;
@@ -276,6 +295,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- [20] _draw
 CREATE OR REPLACE FUNCTION _draw(p_id_game bigint, p_id_player bigint) RETURNS bigint AS $$
 DECLARE
     v_card bigint;
@@ -301,6 +321,7 @@ $$ LANGUAGE plpgsql;
 
 -- --- применение активных механик ---------------------------------------------
 
+-- [21] _apply_active_mechanics
 CREATE OR REPLACE FUNCTION _apply_active_mechanics(
     p_id_game bigint,
     p_actor   bigint,
@@ -411,6 +432,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- [22] _final_zone
 CREATE OR REPLACE FUNCTION _final_zone(p_id_card bigint) RETURNS text AS $$
 BEGIN
     IF _has_mechanic(p_id_card, 'MOVE_TO_DISCARD') OR _has_mechanic(p_id_card, 'MOVE_TO_NURSERY') THEN
@@ -438,6 +460,7 @@ END;
 $$ LANGUAGE plpgsql STABLE;
 
 
+-- [23] _apply_play
 CREATE OR REPLACE FUNCTION _apply_play(
     p_id_game bigint,
     p_actor   bigint,
@@ -467,6 +490,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- [24] _fire_turn_start
 CREATE OR REPLACE FUNCTION _fire_turn_start(p_id_game bigint, p_id_player bigint) RETURNS void AS $$
 DECLARE
     r record;
@@ -480,6 +504,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- [25] _available
 -- Список доступных к розыгрышу карт (приватный, отдаётся внутри снимка партии).
 CREATE OR REPLACE FUNCTION _available(p_id_game bigint, p_id_player bigint) RETURNS jsonb AS $$
 BEGIN
@@ -523,6 +548,7 @@ $$ LANGUAGE plpgsql STABLE;
 --  ЧТЕНИЕ
 -- =============================================================================
 
+-- [26] fn_get_player
 CREATE OR REPLACE FUNCTION fn_get_player(p_user_id uuid) RETURNS jsonb AS $$
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
         'id_player', p.id_player,
@@ -534,6 +560,7 @@ CREATE OR REPLACE FUNCTION fn_get_player(p_user_id uuid) RETURNS jsonb AS $$
 $$ LANGUAGE sql STABLE;
 
 
+-- [27] fn_list_open_games
 CREATE OR REPLACE FUNCTION fn_list_open_games(
     p_has_slot boolean DEFAULT TRUE,
     p_mine     boolean DEFAULT FALSE,
@@ -555,6 +582,7 @@ CREATE OR REPLACE FUNCTION fn_list_open_games(
 $$ LANGUAGE sql STABLE;
 
 
+-- [28] fn_get_catalog
 CREATE OR REPLACE FUNCTION fn_get_catalog() RETURNS jsonb AS $$
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
         'id',          ct.id_card_template,
@@ -571,6 +599,7 @@ CREATE OR REPLACE FUNCTION fn_get_catalog() RETURNS jsonb AS $$
 $$ LANGUAGE sql STABLE;
 
 
+-- [29] fn_get_game_state
 CREATE OR REPLACE FUNCTION fn_get_game_state(p_id_game bigint, p_id_player bigint DEFAULT NULL)
 RETURNS jsonb AS $$
 DECLARE
@@ -645,6 +674,7 @@ END;
 $$ LANGUAGE plpgsql STABLE;
 
 
+-- [30] fn_check_victory
 CREATE OR REPLACE FUNCTION fn_check_victory(p_id_game bigint) RETURNS jsonb AS $$
 DECLARE
     v_players   int;
@@ -698,6 +728,7 @@ $$ LANGUAGE plpgsql STABLE;
 --  СПРАВОЧНИКИ / АДМИНКА
 -- =============================================================================
 
+-- [31] fn_list_mechanics
 CREATE OR REPLACE FUNCTION fn_list_mechanics() RETURNS jsonb AS $$
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
         'id',          id_mechanic,
@@ -710,6 +741,7 @@ CREATE OR REPLACE FUNCTION fn_list_mechanics() RETURNS jsonb AS $$
 $$ LANGUAGE sql STABLE;
 
 
+-- [32] fn_list_card_templates
 CREATE OR REPLACE FUNCTION fn_list_card_templates(p_search text DEFAULT NULL) RETURNS jsonb AS $$
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
         'id',          ct.id_card_template,
@@ -734,6 +766,7 @@ CREATE OR REPLACE FUNCTION fn_list_card_templates(p_search text DEFAULT NULL) RE
 $$ LANGUAGE sql STABLE;
 
 
+-- [33] fn_get_card_template
 CREATE OR REPLACE FUNCTION fn_get_card_template(p_id bigint) RETURNS jsonb AS $$
 DECLARE
     v_json jsonb;
@@ -759,6 +792,7 @@ END;
 $$ LANGUAGE plpgsql STABLE;
 
 
+-- [34] sp_create_card_template
 CREATE OR REPLACE FUNCTION sp_create_card_template(
     p_name text, p_description text, p_img_link text
 ) RETURNS jsonb AS $$
@@ -775,6 +809,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- [35] sp_update_card_template
 CREATE OR REPLACE FUNCTION sp_update_card_template(
     p_id bigint, p_name text, p_description text, p_img_link text
 ) RETURNS jsonb AS $$
@@ -794,6 +829,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- [36] sp_set_card_mechanics
 CREATE OR REPLACE FUNCTION sp_set_card_mechanics(p_id_template bigint, p_ids bigint[])
 RETURNS jsonb AS $$
 BEGIN
@@ -818,6 +854,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- [37] sp_add_cards_to_game
 CREATE OR REPLACE FUNCTION sp_add_cards_to_game(p_id_game bigint, p_id_template bigint, p_count int)
 RETURNS jsonb AS $$
 BEGIN
@@ -845,6 +882,7 @@ $$ LANGUAGE plpgsql;
 --  ЛОББИ
 -- =============================================================================
 
+-- [38] sp_create_game
 CREATE OR REPLACE FUNCTION sp_create_game(
     p_user_id uuid, p_name text, p_max_players int, p_password_hash text DEFAULT NULL
 ) RETURNS jsonb AS $$
@@ -874,6 +912,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- [39] sp_join_game
 CREATE OR REPLACE FUNCTION sp_join_game(
     p_user_id uuid, p_id_game bigint, p_password_hash text DEFAULT NULL
 ) RETURNS jsonb AS $$
@@ -918,6 +957,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- [40] sp_leave_game
 CREATE OR REPLACE FUNCTION sp_leave_game(p_id_player bigint, p_id_game bigint) RETURNS void AS $$
 DECLARE
     r record;
@@ -943,6 +983,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- [41] sp_update_game
 CREATE OR REPLACE FUNCTION sp_update_game(
     p_id_game bigint, p_id_user uuid,
     p_name text DEFAULT NULL, p_max_players int DEFAULT NULL, p_password_hash text DEFAULT NULL
@@ -992,6 +1033,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- [42] sp_cancel_game
 CREATE OR REPLACE FUNCTION sp_cancel_game(p_id_game bigint, p_id_user uuid) RETURNS void AS $$
 BEGIN
     PERFORM _game_lock(p_id_game);
@@ -1009,6 +1051,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- [43] sp_set_game_password
 CREATE OR REPLACE FUNCTION sp_set_game_password(p_id_game bigint, p_password_hash text) RETURNS void AS $$
 BEGIN
     PERFORM _game_lock(p_id_game);
@@ -1033,6 +1076,7 @@ $$ LANGUAGE plpgsql;
 --  ИГРА
 -- =============================================================================
 
+-- [44] sp_start_game
 CREATE OR REPLACE FUNCTION sp_start_game(p_id_game bigint) RETURNS jsonb AS $$
 DECLARE
     v_players int;
@@ -1072,6 +1116,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- [45] sp_begin_turn
 CREATE OR REPLACE FUNCTION sp_begin_turn(p_id_game bigint, p_skip_player bigint DEFAULT NULL) RETURNS jsonb AS $$
 DECLARE
     v_candidate bigint;
@@ -1109,6 +1154,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- [46] sp_skip_turn
 CREATE OR REPLACE FUNCTION sp_skip_turn(p_id_game bigint) RETURNS jsonb AS $$
 DECLARE
     v_player bigint;
@@ -1127,6 +1173,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- [47] sp_apply_event
 -- Актор не передаётся: это всегда текущий игрок. Проверка «не его ход» живёт на
 -- сервере; база проверяет номер хода и что карта лежит в руке текущего игрока.
 CREATE OR REPLACE FUNCTION sp_apply_event(
@@ -1166,6 +1213,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- [48] sp_end_turn
 CREATE OR REPLACE FUNCTION sp_end_turn(p_id_game bigint, p_turn int) RETURNS void AS $$
 DECLARE
     v_actor  bigint;
@@ -1196,6 +1244,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- [49] sp_resolve_stable_effects
 CREATE OR REPLACE FUNCTION sp_resolve_stable_effects(p_id_game bigint) RETURNS jsonb AS $$
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
         'id_player',  p.id_player,
@@ -1207,6 +1256,7 @@ CREATE OR REPLACE FUNCTION sp_resolve_stable_effects(p_id_game bigint) RETURNS j
 $$ LANGUAGE sql;
 
 
+-- [50] sp_fire_turn_start
 CREATE OR REPLACE FUNCTION sp_fire_turn_start(p_id_player bigint) RETURNS void AS $$
 DECLARE
     v_game bigint;
@@ -1220,6 +1270,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- [51] fn_notify
 -- публичная обёртка над _notify (по API.md)
 CREATE OR REPLACE FUNCTION fn_notify(p_id_game bigint, p_event text) RETURNS void AS $$
 BEGIN
