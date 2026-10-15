@@ -1,0 +1,25 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: edin-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-edin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-edin}
+      POSTGRES_DB: ${POSTGRES_DB:-edin}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/00_init.sql:ro
+      - ./db/10_mechanic_seed.sql:/docker-entrypoint-initdb.d/10_mechanic_seed.sql:ro
+      - ./db/20_functions.sql:/docker-entrypoint-initdb.d/20_functions.sql:ro
+      - ./db/90_demo_seed.sql:/docker-entrypoint-initdb.d/90_demo_seed.sql:ro
+      - ./tests:/tests:ro
+      - edin_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-edin} -d ${POSTGRES_DB:-edin}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  edin_pgdata:
